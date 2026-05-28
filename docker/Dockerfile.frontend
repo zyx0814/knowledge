@@ -1,0 +1,29 @@
+# 前端Dockerfile
+FROM node:18-alpine
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制依赖文件
+COPY frontend/package.json ./
+
+# 安装依赖
+RUN npm install
+
+# 复制前端代码
+COPY frontend/ .
+
+# 构建前端
+RUN npm run build
+
+# 安装nginx
+RUN apk add --no-cache nginx
+
+# 配置nginx
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+
+# 暴露端口
+EXPOSE 3000
+
+# 启动nginx
+CMD ["nginx", "-g", "daemon off;"]

@@ -1,0 +1,37 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+python-multipart
+pdfplumber
+python-docx
+openpyxl
+Pillow
+numpy
+requests
+pytesseract
+openai-whisper
+pymysql
+psycopg2-binary
+insightface
+opencv-python
+qdrant-client
+redis
+celery
+minio
+prometheus-client
+
+# FAISS - CPU 版本（默认）
+faiss-cpu
+
+# ONNX Runtime - CPU 版本（默认）
+onnxruntime
+
+# GPU 版本（已启用）
+# faiss-gpu
+# onnxruntime-gpu
+torch
+
+# CLIP 模型（跨模态检索）
+clip-anytorch
