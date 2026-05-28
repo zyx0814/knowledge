@@ -29,6 +29,6 @@ sentence-transformers
 # onnxruntime
 
 # GPU 版本（已启用）
-faiss-gpu
+faiss
 onnxruntime-gpu
 torch
