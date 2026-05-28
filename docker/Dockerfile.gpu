@@ -61,7 +61,11 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 COPY --chown=appuser:appuser backend/requirements_gpu.txt .
 
 # 安装Python依赖（GPU版本）
-RUN pip install --no-cache-dir -r requirements_gpu.txt
+# 根据架构选择FAISS包：faiss-gpu仅支持x86_64，ARM64使用faiss-cpu
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+        sed -i 's/faiss-gpu/faiss-cpu/g' requirements_gpu.txt; \
+    fi && \
+    pip install --no-cache-dir -r requirements_gpu.txt
 
 # 复制后端代码
 COPY --chown=appuser:appuser backend/ .
