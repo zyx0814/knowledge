@@ -178,13 +178,20 @@ async def upload_file(
             file_ext = "png"
         else:
             raise HTTPException(status_code=400, detail="必须提供文件或base64数据")
-        if file_ext in ["pdf", "docx", "doc", "xlsx", "xls", "md", "txt"]:
+        # 文档类支持的文件格式
+        document_extensions = ["pdf", "doc", "docx", "rtf", "odt", "txt", "ppt", "pptx", "pps", "odp", "xls", "xlsx", "ods", "csv"]
+        # 视频类支持的文件格式
+        video_extensions = ["avi", "rm", "rmvb", "mkv", "mov", "wmv", "asf", "mpg", "mpe", "mpeg", "mp4", "m4v", "f4v", "vob", "ogv", "mts", "m2ts", "3gp", "webm", "flv", "wav", "vqf", "ra", "mxf"]
+        # 图片类支持的文件格式
+        image_extensions = ["jpg", "jpeg", "png", "webp", "bmp", "gif"]
+        
+        if file_ext in document_extensions:
             file_type = "document"
             subformat = file_ext
-        elif file_ext in ["jpg", "jpeg", "png", "webp", "bmp"]:
+        elif file_ext in image_extensions:
             file_type = "image"
             subformat = file_ext
-        elif file_ext in ["mp4", "avi", "mov", "flv", "mkv", "wmv", "webm", "m4v"]:
+        elif file_ext in video_extensions:
             file_type = "video"
             subformat = file_ext
         else:
@@ -714,9 +721,9 @@ def _process_batch_import_sync(task_id: str, directory: str, rid: str, gid: str)
         directory = directory.strip()
         directory = directory.replace('\\', os.sep).replace('/', os.sep)
         allowed_extensions = {
-            'document': ['pdf', 'docx', 'doc', 'xlsx', 'xls', 'md', 'txt'],
-            'image': ['jpg', 'jpeg', 'png', 'webp', 'bmp'],
-            'video': ['mp4', 'avi', 'mov', 'flv']
+            'document': ['pdf', 'doc', 'docx', 'rtf', 'odt', 'txt', 'ppt', 'pptx', 'pps', 'odp', 'xls', 'xlsx', 'ods', 'csv'],
+            'image': ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif'],
+            'video': ['avi', 'rm', 'rmvb', 'mkv', 'mov', 'wmv', 'asf', 'mpg', 'mpe', 'mpeg', 'mp4', 'm4v', 'f4v', 'vob', 'ogv', 'mts', 'm2ts', '3gp', 'webm', 'flv', 'wav', 'vqf', 'ra', 'mxf']
         }
         all_files = []
         for root, dirs, files in os.walk(directory):

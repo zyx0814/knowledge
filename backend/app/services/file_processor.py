@@ -29,8 +29,8 @@ class FileProcessor:
                 doc = Document(file_path)
                 text = "\n".join([para.text for para in doc.paragraphs])
                 chunks = FileProcessor._split_text(text)
-            elif file_type in ["xlsx", "xls"]:
-                # 使用openpyxl解析Excel
+            elif file_type in ["xlsx", "xls", "ods"]:
+                # 使用openpyxl解析Excel和ODS
                 from openpyxl import load_workbook
                 wb = load_workbook(file_path)
                 text = ""
@@ -40,6 +40,53 @@ class FileProcessor:
                         row_text = "\t".join([str(cell) if cell is not None else "" for cell in row])
                         text += row_text + "\n"
                 chunks = FileProcessor._split_text(text)
+            elif file_type == "csv":
+                # 处理CSV文件
+                import csv
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    reader = csv.reader(f)
+                    text = "\n".join(["\t".join(row) for row in reader])
+                chunks = FileProcessor._split_text(text)
+            elif file_type == "rtf":
+                # 使用striprtf解析RTF
+                try:
+                    from striprtf.striprtf import rtf_to_text
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        rtf_content = f.read()
+                    text = rtf_to_text(rtf_content)
+                    chunks = FileProcessor._split_text(text)
+                except ImportError:
+                    # 如果striprtf未安装，尝试使用unrtf命令行工具
+                    try:
+                        result = subprocess.run(["unrtf", file_path], capture_output=True, text=True)
+                        text = result.stdout
+                        chunks = FileProcessor._split_text(text)
+                    except:
+                        print("无法解析RTF文件")
+            elif file_type in ["ppt", "pptx", "pps", "odp"]:
+                # 使用python-pptx解析PPT
+                try:
+                    from pptx import Presentation
+                    prs = Presentation(file_path)
+                    text = ""
+                    for slide in prs.slides:
+                        for shape in slide.shapes:
+                            if hasattr(shape, "text"):
+                                text += shape.text + "\n"
+                    chunks = FileProcessor._split_text(text)
+                except Exception as e:
+                    print(f"解析PPT失败: {e}")
+            elif file_type == "odt":
+                # 使用odfpy解析ODT
+                try:
+                    from odf import text, teletype
+                    from odf.opendocument import load
+                    doc = load(file_path)
+                    paragraphs = doc.getElementsByType(text.P)
+                    text_content = "\n".join([teletype.extractText(p) for p in paragraphs])
+                    chunks = FileProcessor._split_text(text_content)
+                except ImportError:
+                    print("odfpy未安装，无法解析ODT文件")
             elif file_type in ["md", "txt"]:
                 # 直接读取文本文件
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -66,11 +113,8 @@ class FileProcessor:
                 try:
                     import pytesseract
                     result["text"] = pytesseract.image_to_string(img)
-                    print(f"OCR识别到的文字: {result['text']}")
                 except Exception as e:
                     print(f"OCR识别失败: {e}")
-            else:
-                print("OCR已禁用，跳过文字识别")
             
             # 提取视觉特征（这里使用简单的均值作为示例）
             #  img_array = np.array(img)
@@ -152,7 +196,6 @@ class FileProcessor:
                 if os.path.exists(audio_path):
                     os.remove(audio_path)
             else:
-                print("视频音频转写已禁用，跳过")
                 result["audio_text"] = ""
             
             # 清理临时文件

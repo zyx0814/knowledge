@@ -1,11 +1,16 @@
 import io
 import os
 import uuid
+import hashlib
 import numpy as np
 import faiss
 from typing import List, Dict, Any, Optional
 from config.config import settings
 from app.core.gpu_utils import gpu_manager
+
+def stable_hash(item_id: str) -> int:
+    """生成稳定的哈希值，用于Qdrant的point id"""
+    return int(hashlib.md5(item_id.encode()).hexdigest(), 16) % (2**63)
 # 导入 MinIO 存储服务
 try:
     from app.services.storage_service import storage_service
@@ -391,15 +396,22 @@ class QdrantVectorService:
             port = getattr(settings, 'QDRANT_PORT', 6333)
             self.client = QdrantClient(host=host, port=port)
             self.PointStruct = PointStruct
-            # 检查并创建集合
-            if not self.client.collection_exists(self.collection_name):
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(
-                        size=settings.EMBEDDING_DIM,
-                        distance=Distance.COSINE
+            # 检查并创建集合（处理并发创建的竞态条件）
+            try:
+                if not self.client.collection_exists(self.collection_name):
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=VectorParams(
+                            size=settings.EMBEDDING_DIM,
+                            distance=Distance.COSINE
+                        )
                     )
-                )
+            except Exception as create_e:
+                # 如果集合已存在（并发创建时可能发生），忽略此错误
+                if "already exists" in str(create_e):
+                    pass
+                else:
+                    raise
             
         except ImportError:
            print("qdrant-client not installed")
@@ -504,7 +516,7 @@ class QdrantVectorService:
             return item_id
         try:
             point = self.PointStruct(
-                id=abs(hash(item_id)) % (2**63),
+                id=stable_hash(item_id),
                 vector=vector,
                 payload={
                     "item_id": item_id,
@@ -532,7 +544,7 @@ class QdrantVectorService:
                 fid = file_ids[i] if file_ids else self._extract_file_id(item_id)
                 vtype = vector_types[i] if vector_types else self._extract_vector_type(item_id)
                 point = self.PointStruct(
-                    id=abs(hash(item_id)) % (2**63),
+                    id=stable_hash(item_id),
                     vector=vector,
                     payload={"item_id": item_id, "file_id": fid, "vector_type": vtype}
                 )
