@@ -334,6 +334,25 @@ class FAISSVectorService:
         # 需要重建索引
         self._rebuild_index()
         return True
+    
+    def delete_vectors_by_file_id(self, file_id: str) -> int:
+        """根据 file_id 删除所有相关向量"""
+        # 向量 ID 格式: chunk_{file_id}_{index}, image_{file_id}, video_frame_{file_id}_{timestamp} 等
+        indices_to_remove = []
+        for idx, id_val in self.id_map.items():
+            # 检查向量ID是否包含该file_id
+            if id_val.startswith(f"chunk_{file_id}_") or \
+               id_val.startswith(f"image_{file_id}") or \
+               id_val.startswith(f"video_frame_{file_id}_") or \
+               id_val.startswith(f"video_audio_{file_id}_"):
+                indices_to_remove.append(idx)
+        if not indices_to_remove:
+            return 0
+        for idx in sorted(indices_to_remove, reverse=True):
+            del self.id_map[idx]
+        # 需要重建索引
+        self._rebuild_index()
+        return len(indices_to_remove)
 
     def _rebuild_index(self):
         """重建索引"""
@@ -613,6 +632,34 @@ class QdrantVectorService:
             return True
         except Exception as e:
             return False
+    
+    def delete_vectors_by_file_id(self, file_id: str) -> int:
+        """根据 file_id 删除所有相关向量"""
+        if not self.client:
+            return 0
+        try:
+            # 使用条件过滤删除所有匹配的向量
+            from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+            
+            filter_condition = Filter(
+                must=[
+                    FieldCondition(
+                        key="file_id",
+                        match=MatchValue(value=file_id)
+                    )
+                ]
+            )
+            
+            result = self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=filter_condition
+            )
+            # 返回删除的数量
+            if hasattr(result, 'deleted_count'):
+                return result.deleted_count
+            return 0
+        except Exception as e:
+            return 0
 
     def get_vector_count(self) -> int:
         """获取向量数量（兼容不同版本的 Qdrant 客户端）"""
@@ -711,6 +758,11 @@ class VectorService:
     def delete_vector(self, item_id: str) -> bool:
         """删除指定向量"""
         return self.backend.delete_vector(item_id)
+    
+    def delete_vectors_by_file_id(self, file_id: str) -> int:
+        """根据 file_id 删除所有相关向量"""
+        return self.backend.delete_vectors_by_file_id(file_id)
+    
     def get_vector_count(self) -> int:
         """获取向量数量"""
         return self.backend.get_vector_count()

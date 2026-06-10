@@ -82,14 +82,14 @@ class SearchService:
         sorted_list = sorted(file_results.values(), key=lambda x: x["score"], reverse=True)
         return sorted_list[:limit]
 
-    def keyword_search(self, db: Session, query: str, file_type: str = None, gid: str = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
+    def keyword_search(self, db: Session, query: str, file_type: str = None, gid: List[str] = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
         """关键词检索"""
         results = []
         file_query = db.query(File)
         if file_type:
             file_query = file_query.filter(File.type == file_type)
-        if gid is not None:
-            file_query = file_query.filter(File.gid == gid)
+        if gid is not None and len(gid) > 0:
+            file_query = file_query.filter(File.gid.in_(gid))
         files = file_query.filter(
             File.name.contains(query) |
             File.category.contains(query)
@@ -103,8 +103,8 @@ class SearchService:
         text_query = db.query(TextChunk).join(File)
         if file_type:
             text_query = text_query.filter(File.type == file_type)
-        if gid is not None:
-            text_query = text_query.filter(File.gid == gid)
+        if gid is not None and len(gid) > 0:
+            text_query = text_query.filter(File.gid.in_(gid))
         chunks = text_query.filter(TextChunk.content.contains(query)).limit(limit * 2).all()
         for chunk in chunks:
             results.append({
@@ -117,7 +117,7 @@ class SearchService:
             min_score = self.default_min_score
         return self._dedup_and_limit_by_file_id(results, limit, min_score)
 
-    def semantic_search(self, db: Session, query: str, file_type: str = None, gid: str = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
+    def semantic_search(self, db: Session, query: str, file_type: str = None, gid: List[str] = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
         """语义检索"""
         query_vector = self.vector_service.generate_text_embedding(query)
         vector_count = self.vector_service.get_vector_count()
@@ -143,9 +143,9 @@ class SearchService:
                 is_video_frame = True
             if file_type and file_type_from_id != file_type:
                 continue
-            if gid is not None:
+            if gid is not None and len(gid) > 0:
                 file = db.query(File).filter(File.id == file_id).first()
-                if not file or file.gid != gid:
+                if not file or file.gid not in gid:
                     continue
             score = result.get("score")
             if score is not None:
@@ -174,9 +174,8 @@ class SearchService:
       
         return final_results
 
-    def multimodal_search(self, db: Session, image_features: List[float], limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
+    def multimodal_search(self, db: Session, image_features: List[float], gid: List[str] = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
         """多模态检索（使用 CLIP 模型进行跨模态匹配）"""
-        # 使用 CLIP 模型从图片特征生成嵌入
         image_vector = self.vector_service.generate_image_embedding(image_features)
       
         vector_count = self.vector_service.get_vector_count()
@@ -190,6 +189,11 @@ class SearchService:
             file_id = self._extract_file_id_from_vector_id(vector_id)
             if not file_id:
                 continue
+            # gid 过滤
+            if gid is not None and len(gid) > 0:
+                file = db.query(File).filter(File.id == file_id).first()
+                if not file or file.gid not in gid:
+                    continue
             score = result.get("score")
             if score is not None:
                 score = float(score)
@@ -215,8 +219,9 @@ class SearchService:
             min_score = self.default_min_score
         return self._dedup_and_limit_by_file_id(results, limit, min_score)
 
-    def face_search(self, db: Session, face_embedding: List[float], limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
+    def face_search(self, db: Session, face_embedding: List[float], gid: List[str] = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
         """按人脸搜索"""
+        from app.models.db import File
         from app.services.face_service import FaceService
         face_service = FaceService()
         similar_faces = face_service.find_similar_faces(face_embedding, limit=limit * 2)
@@ -225,6 +230,11 @@ class SearchService:
             file_id = str(face.get("file_id", ""))
             if not file_id:
                 continue
+            # gid 过滤
+            if gid is not None and len(gid) > 0:
+                file = db.query(File).filter(File.id == file_id).first()
+                if not file or file.gid not in gid:
+                    continue
             similarity = float(face.get("similarity", 0.0))
             results.append({
                 "file_id": file_id,
@@ -236,7 +246,7 @@ class SearchService:
             min_score = self.default_min_score
         return self._dedup_and_limit_by_file_id(results, limit, min_score)
 
-    def hybrid_search(self, db: Session, query: str, file_type: str = None, gid: str = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
+    def hybrid_search(self, db: Session, query: str, file_type: str = None, gid: List[str] = None, limit: int = 10, min_score: float = None) -> List[Dict[str, Any]]:
         """混合检索"""
         # 使用配置默认值（如果未指定）
         if min_score is None:

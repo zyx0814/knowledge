@@ -2,6 +2,10 @@ import os
 import asyncio
 import shutil
 import uuid
+import re
+import urllib.parse
+import base64
+import numpy as np
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
@@ -120,15 +124,14 @@ def _enrich_search_results(db: Session, results: List[Dict[str, Any]]) -> List[D
             "file_id": str(file_id),
             "score": float(result.get("score", 0.0)),
             "search_type": result.get("search_type", "unknown"),
-            "file_info": {
-                "id": str(file.id),
-                "rid": str(file.rid) if file.rid else None,
-                "name": str(file.name),
-                "type": str(file.type),
-                "subformat": str(file.subformat),
-                "size": file.size,
-                "imported_at": file.imported_at.isoformat() if file.imported_at else None
-            }
+            "rid": str(file.rid) if file.rid else None,
+            "gid": str(file.gid) if file.gid else None,
+            "name": str(file.name),
+            "type": str(file.type),
+            "ext": str(file.subformat),
+            "size": file.size,
+            "imported_at": file.imported_at.isoformat() if file.imported_at else None,
+           
         }
         if file.type == "image":
             if file.storage_path:
@@ -138,17 +141,71 @@ def _enrich_search_results(db: Session, results: List[Dict[str, Any]]) -> List[D
                 if image_frame and image_frame.frame_path:
                     enriched_result["frame_path"] = str(image_frame.frame_path)
         elif file.type == "video":
-            if result.get("timestamp") is not None:
-                enriched_result["timestamp"] = float(result["timestamp"])
-                frame_info = db.query(ImageFrame).filter(
-                    ImageFrame.file_id == file_id,
-                    ImageFrame.timestamp == result["timestamp"]
-                ).first()
-                if frame_info and frame_info.frame_path:
-                    enriched_result["frame_path"] = str(frame_info.frame_path)
+            # 处理多个时间戳（视频切片）
+            timestamps = result.get("timestamps", [])
+            if timestamps:
+                enriched_result["timestamps"] = []
+                for ts_info in timestamps:
+                    timestamp = ts_info.get("timestamp")
+                    if timestamp is not None:
+                        frame_info = db.query(ImageFrame).filter(
+                            ImageFrame.file_id == file_id,
+                            ImageFrame.timestamp == timestamp
+                        ).first()
+                        ts_result = {
+                            "timestamp": float(timestamp),
+                            "score": float(ts_info.get("score", 0.0))
+                        }
+                        if frame_info and frame_info.frame_path:
+                            ts_result["frame_path"] = str(frame_info.frame_path)
+                        enriched_result["timestamps"].append(ts_result)
         enriched_results.append(enriched_result)
     enriched_results.sort(key=lambda x: x["score"], reverse=True)
     return enriched_results
+    
+@router.post("/file/update")
+async def update_file(
+    file: UploadFile = File(None),
+    base64_data: str = Form(None),
+    url: str = Form(None),
+    rid: str = Form(None),
+    gid: str = Form(None),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """文件更新接口，根据 rid 更新文件（删除旧文件后重新上传）"""
+    try:
+        if not rid:
+            raise HTTPException(status_code=400, detail="必须提供 rid 参数")
+        
+        # 先删除该 rid 下的所有文件及其相关数据
+        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
+        files_to_delete = db.query(File).filter(File.rid == rid).all()
+        deleted_count = 0
+        for f in files_to_delete:
+            file_id = str(f.id)
+            # 删除向量
+            vector_service.delete_vectors_by_file_id(file_id)
+            # 删除数据库记录
+            db.query(TextChunk).filter(TextChunk.file_id == file_id).delete()
+            db.query(ImageFrame).filter(ImageFrame.file_id == file_id).delete()
+            db.query(AudioTranscript).filter(AudioTranscript.file_id == file_id).delete()
+            db.delete(f)
+            deleted_count += 1
+        db.commit()
+        
+        # 如果没有提供新文件，只删除不添加
+        if not file and not base64_data and not url:
+            return {"success": True, "deleted_count": deleted_count, "message": f"成功删除 {deleted_count} 个旧文件，未上传新文件"}
+        
+        # 调用上传逻辑处理新文件
+        return await upload_file(file, base64_data, url, rid, gid, db)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"更新文件失败: {str(e)}")
+
 @router.post("/file/upload")
 async def upload_file(
     file: UploadFile = File(None),
@@ -158,10 +215,8 @@ async def upload_file(
     gid: str = Form(None),
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    """文件上传接口，支持三种方式：1.直接上传文件 2.Base64编码 3.URL下载"""
+    """文件上传接口，支持三种方式：1.直接上传文件 2.Base64 编码 3.URL 下载"""
     try:
-        import uuid
-        import httpx
         if file:
             temp_file_path = file_service.get_temp_file_path(file.filename)
             with open(temp_file_path, "wb") as f:
@@ -169,10 +224,8 @@ async def upload_file(
             file_name = file.filename
             file_ext = file.filename.split(".")[-1].lower()
         elif base64_data:
-            import base64
-            import re
             
-            # MIME类型到文件扩展名的映射
+            # MIME 类型到文件扩展名的映射
             mime_to_ext = {
                 'image/png': 'png',
                 'image/jpeg': 'jpg',
@@ -213,22 +266,25 @@ async def upload_file(
                 response.raise_for_status()
                 
                 file_name = None
+                parsed_url = urllib.parse.urlparse(url)
                 
-                # 优先级1：从 Content-Disposition 头获取文件名
+                # 优先级 1：从 Content-Disposition 头获取文件名
                 content_disposition = response.headers.get('content-disposition', '')
                 if content_disposition:
-                    import re
                     match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
                     if match:
                         file_name = match.group(1).strip('"\'')
                 
                 # 优先级2：从 URL 参数中获取 filename
                 if not file_name:
-                    import urllib.parse
-                    parsed_url = urllib.parse.urlparse(url)
                     query_params = urllib.parse.parse_qs(parsed_url.query)
                     if 'filename' in query_params:
                         file_name = query_params['filename'][0]
+                
+                # 优先级 3：从 URL 路径中提取文件名
+                if not file_name:
+                    path = parsed_url.path
+                    file_name = os.path.basename(path)
                 
                 # 如果都获取不到，返回错误
                 if not file_name:
@@ -237,6 +293,22 @@ async def upload_file(
                 temp_file_path = file_service.get_temp_file_path(file_name)
                 with open(temp_file_path, "wb") as f:
                     f.write(response.content)
+                
+                # 获取文件扩展名
+                if '.' in file_name:
+                    file_ext = file_name.split(".")[-1].lower()
+                else:
+                    # 如果没有扩展名，尝试从 Content-Type 推断
+                    content_type = response.headers.get('content-type', '')
+                    content_type_map = {
+                        'image/jpeg': 'jpg',
+                        'image/png': 'png',
+                        'image/gif': 'gif',
+                        'image/webp': 'webp',
+                        'application/pdf': 'pdf',
+                        'text/plain': 'txt',
+                    }
+                    file_ext = content_type_map.get(content_type.split(';')[0].strip(), 'bin')
         else:
             raise HTTPException(status_code=400, detail="必须提供文件、base64数据或URL")
         # 文档类支持的文件格式
@@ -490,7 +562,7 @@ async def get_file_detail(
 async def search(
     query: str,
     file_type: str = None,
-    gid: str = None,
+    gid: List[str] = None,
     limit: int = 50,
     min_score: float = None,
     db: Session = Depends(get_db)
@@ -514,7 +586,7 @@ async def qa(
 async def search_image(
     file: UploadFile = File(None),
     base64_data: str = Form(None),
-    gid: str = Form(None),
+    gid: List[str] = Form(None),
     limit: int = 50,
     min_score: float = None,
     db: Session = Depends(get_db)
@@ -524,7 +596,6 @@ async def search_image(
     if min_score is None:
         min_score = settings.SEARCH_MIN_SCORE
     try:
-        import uuid
         temp_file_path = None
         if file:
             temp_file_path = f"{settings.TEMP_DIR}/{file.filename}"
@@ -533,11 +604,35 @@ async def search_image(
                 content = await file.read()
                 f.write(content)
         elif base64_data:
-            import base64
-            if base64_data.startswith('data:image/'):
+            
+            # MIME 类型到文件扩展名的映射
+            mime_to_ext = {
+                'image/png': 'png',
+                'image/jpeg': 'jpg',
+                'image/jpg': 'jpg',
+                'image/gif': 'gif',
+                'image/webp': 'webp',
+                'image/bmp': 'bmp',
+                'image/tiff': 'tif',
+                'image/svg+xml': 'svg'
+            }
+            
+            # 默认扩展名
+            file_ext = 'png'
+            
+            # 从 data URL 中提取 MIME 类型
+            mime_match = re.match(r'data:([^;]+);base64,', base64_data)
+            if mime_match:
+                mime_type = mime_match.group(1).lower()
+                if mime_type in mime_to_ext:
+                    file_ext = mime_to_ext[mime_type]
+            
+            # 提取 base64 数据
+            if ',' in base64_data:
                 base64_data = base64_data.split(',')[1]
+            
             image_data = base64.b64decode(base64_data)
-            file_name = f"{str(uuid.uuid4())}.png"
+            file_name = f"{str(uuid.uuid4())}.{file_ext}"
             temp_file_path = f"{settings.TEMP_DIR}/{file_name}"
             os.makedirs(settings.TEMP_DIR, exist_ok=True)
             with open(temp_file_path, "wb") as f:
@@ -546,7 +641,7 @@ async def search_image(
             raise HTTPException(status_code=400, detail="必须提供文件或base64数据")
         # 使用CLIP模型从图片路径生成嵌入（与上传时使用相同的方法）
         clip_embedding = vector_service.generate_image_embedding_from_path(temp_file_path)
-        search_results = search_service.multimodal_search(db, clip_embedding, limit=limit, min_score=min_score)
+        search_results = search_service.multimodal_search(db, clip_embedding, gid=gid, limit=limit, min_score=min_score)
         # 人脸检测（用于人脸搜索）
         from app.services.file_processor import FileProcessor
         file_processor = FileProcessor()
@@ -565,6 +660,169 @@ async def search_image(
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=f"图片搜索失败: {str(e)}")
+
+@router.post("/search/face")
+async def search_face(
+    file: UploadFile = File(None),
+    base64_data: str = Form(None),
+    gid: List[str] = Form(None),
+    limit: int = 10,
+    min_score: float = None,
+    db: Session = Depends(get_db)
+) -> List[Dict[str, Any]]:
+    """按人脸搜索接口"""
+    # 使用配置默认值（如果未指定）
+    if min_score is None:
+        min_score = settings.FACE_SEARCH_THRESHOLD
+    try:
+        temp_file_path = None
+        if file:
+            temp_file_path = f"{settings.TEMP_DIR}/{file.filename}"
+            os.makedirs(settings.TEMP_DIR, exist_ok=True)
+            with open(temp_file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+        elif base64_data:
+            if base64_data.startswith('data:image/'):
+                base64_data = base64_data.split(',')[1]
+            image_data = base64.b64decode(base64_data)
+            file_name = f"{uuid.uuid4()}.png"
+            temp_file_path = f"{settings.TEMP_DIR}/{file_name}"
+            os.makedirs(settings.TEMP_DIR, exist_ok=True)
+            with open(temp_file_path, "wb") as f:
+                f.write(image_data)
+        else:
+            raise HTTPException(status_code=400, detail="必须提供文件或 base64 数据")
+        from app.services.face_service import FaceService
+        face_service = FaceService()
+        face_features = face_service.extract_face_features(temp_file_path)
+        if not face_features:
+            return []
+        all_results = []
+        for face_feature in face_features:
+            face_embedding = face_feature["embedding"]
+            face_results = search_service.face_search(db, face_embedding, gid=gid, limit=limit, min_score=min_score)
+            all_results.extend(face_results)
+        if temp_file_path:
+            file_service.clean_temp_file(temp_file_path)
+        return _enrich_search_results(db, all_results)
+    except Exception as e:
+        if 'temp_file_path' in locals() and temp_file_path:
+            file_service.clean_temp_file(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"按人脸搜索失败: {str(e)}")
+@router.get("/faces")
+async def get_face_list(
+    skip: int = 0,
+    limit: int = 100,
+    name: str = None,
+    db: Session = Depends(get_db)
+) -> List[Dict[str, Any]]:
+    """获取人脸列表"""
+    from app.services.face_service import FaceService
+    face_service = FaceService()
+    return face_service.get_face_list(db, skip, limit, name)
+
+@router.get("/faces/{face_id}")
+async def get_face_details(
+    face_id: str,
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """获取人脸详情"""
+    from app.services.face_service import FaceService
+    face_service = FaceService()
+    details = face_service.get_face_details(db, face_id)
+    if not details:
+        raise HTTPException(status_code=404, detail="人脸不存在")
+    return details
+
+@router.put("/faces/{face_id}/name")
+async def update_face_name(
+    face_id: str,
+    name: str = Form(...),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """更新人脸名称"""
+    from app.services.face_service import FaceService
+    face_service = FaceService()
+    success = face_service.update_face_name(db, face_id, name)
+    if not success:
+        raise HTTPException(status_code=404, detail="人脸不存在")
+    return {"success": True, "message": "人脸名称更新成功"}
+    
+@router.post("/faces/merge")
+async def merge_faces(
+    face_ids: List[str] = Form(...),
+    name: str = Form(None),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """合并人脸"""
+    from app.services.face_service import FaceService
+    face_service = FaceService()
+    group_id = face_service.merge_faces(db, face_ids, name)
+    return {"success": True, "group_id": group_id, "message": "人脸合并成功"}
+@router.delete("/faces/{face_id}")
+async def delete_face(
+    face_id: str,
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """删除人脸"""
+    from app.services.face_service import FaceService
+    face_service = FaceService()
+    success = face_service.delete_face(db, face_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="人脸不存在")
+    return {"success": True, "message": "人脸删除成功"}
+@router.post("/faces/add")
+async def add_face(
+    file: UploadFile = File(None),
+    base64_data: str = Form(None),
+    name: str = Form(None),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """添加人脸"""
+    try:
+        temp_file_path = None
+        if file:
+            temp_file_path = f"{settings.TEMP_DIR}/{file.filename}"
+            os.makedirs(settings.TEMP_DIR, exist_ok=True)
+            with open(temp_file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+        elif base64_data:
+            if base64_data.startswith('data:image/'):
+                base64_data = base64_data.split(',')[1]
+            image_data = base64.b64decode(base64_data)
+            file_name = f"{uuid.uuid4()}.png"
+            temp_file_path = f"{settings.TEMP_DIR}/{file_name}"
+            os.makedirs(settings.TEMP_DIR, exist_ok=True)
+            with open(temp_file_path, "wb") as f:
+                f.write(image_data)
+        else:
+            raise HTTPException(status_code=400, detail="必须提供文件或 base64 数据")
+        from app.services.face_service import FaceService
+        face_service = FaceService()
+        face_features = face_service.extract_face_features(temp_file_path)
+        if not face_features:
+            if temp_file_path:
+                file_service.clean_temp_file(temp_file_path)
+            raise HTTPException(status_code=400, detail="未检测到人脸")
+        saved_face_ids = face_service.save_face_features(db, "", face_features)
+        if name and saved_face_ids:
+            for face_id in saved_face_ids:
+                face_service.update_face_name(db, face_id, name)
+        if temp_file_path:
+            file_service.clean_temp_file(temp_file_path)
+        return {
+            "success": True,
+            "face_ids": saved_face_ids,
+            "message": f"成功添加 {len(saved_face_ids)} 个人脸"
+        }
+    except Exception as e:
+        if 'temp_file_path' in locals() and temp_file_path:
+            file_service.clean_temp_file(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"添加人脸失败: {str(e)}")
+
+
 @router.get("/stats")
 async def get_stats(
     rid: str = None,
@@ -669,6 +927,31 @@ async def batch_delete_files(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"批量删除失败: {str(e)}")
+@router.delete("/file/by_rid")
+async def delete_files_by_rid(
+    rid: str,
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """通过 rid 删除所有相关文件"""
+    try:
+        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
+        # 获取该 rid 下的所有文件
+        files = db.query(File).filter(File.rid == rid).all()
+        if not files:
+            return {"success": True, "deleted_count": 0, "message": "没有找到该 rid 下的文件"}
+        deleted_count = 0
+        for file in files:
+            file_id = str(file.id)
+            db.query(TextChunk).filter(TextChunk.file_id == file_id).delete()
+            db.query(ImageFrame).filter(ImageFrame.file_id == file_id).delete()
+            db.query(AudioTranscript).filter(AudioTranscript.file_id == file_id).delete()
+            db.delete(file)
+            deleted_count += 1
+        db.commit()
+        return {"success": True, "deleted_count": deleted_count, "message": f"成功删除 {deleted_count} 个文件"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
 @router.post("/task/start")
 async def start_task(
     task_type: str,
@@ -739,7 +1022,6 @@ def process_folder_import(task_id: str, directory: str, rid: str = None, gid: st
     from app.services.vector_service import VectorService
     from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
     from datetime import datetime
-    import uuid
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     # 使用线程安全的方式更新任务状态
@@ -970,8 +1252,6 @@ def process_url_import(task_id: str, url: str, rid: str = None, gid: str = None)
     from app.services.vector_service import VectorService
     from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
     from datetime import datetime
-    import uuid
-    import httpx
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     def run_async(coro):
@@ -1001,7 +1281,6 @@ def process_url_import(task_id: str, url: str, rid: str = None, gid: str = None)
             content_type = response.headers.get('content-type', '')
             content_disposition = response.headers.get('content-disposition', '')
             if 'attachment' in content_disposition or 'filename' in content_disposition:
-                import re
                 match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
                 if match:
                     file_name = match.group(1).strip('"\'')
