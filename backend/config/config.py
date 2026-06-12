@@ -1,6 +1,7 @@
 import os
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, Dict
+
 class Settings(BaseSettings):
     """系统配置类"""
     # 基础配置
@@ -56,13 +57,41 @@ class Settings(BaseSettings):
     # 通用模型目录
     MODELS_DIR: str = "models"
     MAX_FILE_SIZE: int = 10 * 1024 * 1024 * 1024  # 10GB
-    # 向量库配置
+    # 向量库
     VECTOR_DB_PATH: str = "vector_db"
-    EMBEDDING_DIM: int = 512  # CLIP ViT-B/32 模型输出维度
-    # 模型配置
+    EMBEDDING_DIM: int = 512  # 默认，由 _resolve_embedding_dim() 自动覆盖
+
+    # 模型输出维度映射（仅多模态模型）
+    MODEL_DIMENSIONS: Dict[str, int] = {
+        # OpenAI CLIP
+        "ViT-B/32": 512,
+        "ViT-B/16": 512,
+        "ViT-L/14": 768,
+        "ViT-L/14@336px": 768,
+        # Chinese-CLIP
+        "OFA-Sys/chinese-clip-vit-base-patch16": 512,
+        "OFA-Sys/chinese-clip-vit-large-patch14": 768,
+        "OFA-Sys/chinese-clip-vit-huge-patch14": 1024,
+        # Jina-CLIP-v2（推荐：多语言多模态最强）
+        "jinaai/jina-clip-v2": 1024,
+        # Qwen3-VL-Embedding
+        "Qwen/Qwen3-VL-Embedding-2B": 2048,
+        "Qwen/Qwen3-VL-Embedding-8B": 4096,
+        # WeCLIP
+        "alibaba-nlp/weclip-base": 512,
+        "alibaba-nlp/weclip-large": 768,
+    }
+
+    # LLM 配置
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     LLM_MODEL: str = "llama3"
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+
+    # 嵌入模型（所有模型均为多模态，文本和图像在同一向量空间，天然支持以文搜图+以图搜图）
+    # 推荐: jinaai/jina-clip-v2（1024维，中英文多模态最强）
+    # 轻量: OFA-Sys/chinese-clip-vit-base-patch16（512维，中文多模态）
+    # 极致: Qwen/Qwen3-VL-Embedding-8B（4096维，需GPU 12GB+）
+    EMBEDDING_MODEL: str = "jinaai/jina-clip-v2"  # 改为 jinaai/jina-clip-v2 即可升级
+
     # 处理配置
     MAX_WORKERS: int = 2
     CHUNK_SIZE: int = 512
@@ -83,4 +112,10 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+
+    def _resolve_embedding_dim(self) -> int:
+        """自动解析当前模型的输出维度"""
+        return self.MODEL_DIMENSIONS.get(self.EMBEDDING_MODEL, 512)
+
+
 settings = Settings()

@@ -7,6 +7,12 @@ import faiss
 from typing import List, Dict, Any, Optional
 from config.config import settings
 from app.core.gpu_utils import gpu_manager
+from app.services.embedding_registry import (
+    generate_text_embedding as _reg_text_embed,
+    generate_image_embedding_from_path as _reg_image_embed_path,
+    generate_image_embedding as _reg_image_embed,
+    generate_video_embedding as _reg_video_embed,
+)
 
 def stable_hash(item_id: str) -> int:
     """生成稳定的哈希值，用于Qdrant的point id"""
@@ -147,7 +153,7 @@ class FAISSVectorService:
 
     def _create_index(self, n_vectors: int = 0) -> faiss.Index:
         """根据数据量创建最优索引"""
-        dim = settings.EMBEDDING_DIM
+        dim = settings._resolve_embedding_dim()
         if n_vectors < 10000:
             return faiss.IndexFlatL2(dim)
         elif n_vectors < 500000:
@@ -179,82 +185,23 @@ class FAISSVectorService:
                 new_index.add(vectors)
             self.index = new_index
             self._dirty = True
-
     def generate_text_embedding(self, text: str) -> List[float]:
-        """生成文本嵌入向量（使用CLIP）"""
-        global _clip_model
-        clip_model, _ = _init_clip_model()
-        if clip_model is not None:
-            try:
-                import torch
-                from clip import clip
-                device = "cuda" if gpu_manager.cuda_available else "cpu"
-                text_tokens = clip.tokenize([text]).to(device)
-                with torch.no_grad():
-                    text_features = clip_model.encode_text(text_tokens)
-                # 归一化
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                return text_features.cpu().numpy().flatten().tolist()
-            except Exception as e:
-                pass
-        # 降级到随机向量
-        return np.random.rand(settings.EMBEDDING_DIM).tolist()
+        """??????????????????"""
+        return _reg_text_embed(text)
 
     def generate_image_embedding_from_path(self, image_path: str) -> List[float]:
-        """从图片路径生成图片嵌入向量（使用CLIP，支持 MinIO）"""
-        global _clip_model, _clip_preprocess
-        clip_model, clip_preprocess = _init_clip_model()
-        if clip_model is not None and clip_preprocess is not None:
-            try:
-                import torch
-                device = "cuda" if gpu_manager.cuda_available else "cpu"
-                # 使用统一的图片读取函数（支持 MinIO）
-                image = _read_image_from_path(image_path)
-                if image is None:
-                    return np.random.rand(settings.EMBEDDING_DIM).tolist()
-                image_input = clip_preprocess(image).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    image_features = clip_model.encode_image(image_input)
-                # 归一化
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                return image_features.cpu().numpy().flatten().tolist()
-            except Exception as e:
-                pass
-        # 降级到简单特征（像素均值）- 这会导致语义搜索失败！
-        try:
-            # 使用统一的图片读取函数（支持 MinIO）
-            img = _read_image_from_path(image_path)
-            if img is None:
-                return np.random.rand(settings.EMBEDDING_DIM).tolist()
-            img = img.resize((224, 224))
-            img_array = np.array(img)
-            features = img_array.mean(axis=(0, 1)).tolist()
-            embedding = np.zeros(settings.EMBEDDING_DIM)
-            embedding[:len(features)] = features
-            return embedding.tolist()
-        except Exception as e:
-            return np.random.rand(settings.EMBEDDING_DIM).tolist()
+        """????????????????????????? MinIO?"""
+        return _reg_image_embed_path(image_path)
 
     def generate_image_embedding(self, features: List[float]) -> List[float]:
-        """生成图片嵌入向量（兼容旧接口）"""
-        embedding = np.zeros(settings.EMBEDDING_DIM)
-        embedding[:len(features)] = features
-        return embedding.tolist()
+        """???????????????"""
+        return _reg_image_embed(features)
 
     def generate_video_embedding(self, frame_features: List[List[float]], audio_text: str) -> List[float]:
-        """生成视频嵌入向量"""
-        if not frame_features:
-            if audio_text:
-                return self.generate_text_embedding(audio_text)
-            else:
-                return np.random.rand(settings.EMBEDDING_DIM).tolist()
-        frame_mean = np.mean(frame_features, axis=0)
-        if audio_text:
-            audio_embedding = self.generate_text_embedding(audio_text)
-            embedding = (frame_mean + np.array(audio_embedding)) / 2
-        else:
-            embedding = frame_mean
-        return embedding.tolist()
+        """????????"""
+        return _reg_video_embed(frame_features, audio_text)
+
+
 
     def add_vector(self, vector: List[float], item_id: str, auto_save: bool = False, 
                    file_id: str = None, vector_type: str = None, gid: str = None) -> int:
@@ -421,7 +368,7 @@ class QdrantVectorService:
                     self.client.create_collection(
                         collection_name=self.collection_name,
                         vectors_config=VectorParams(
-                            size=settings.EMBEDDING_DIM,
+                            size=settings._resolve_embedding_dim(),
                             distance=Distance.COSINE
                         )
                     )
@@ -456,81 +403,26 @@ class QdrantVectorService:
         return 'unknown'
 
     def generate_text_embedding(self, text: str) -> List[float]:
-        """生成文本嵌入向量（使用CLIP）"""
-        global _clip_model
-        clip_model, _ = _init_clip_model()
-        if clip_model is not None:
-            try:
-                import torch
-                from clip import clip
-                device = "cuda" if gpu_manager.cuda_available else "cpu"
-                text_tokens = clip.tokenize([text]).to(device)
-                with torch.no_grad():
-                    text_features = clip_model.encode_text(text_tokens)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                return text_features.cpu().numpy().flatten().tolist()
-            except Exception as e:
-                pass
-        return np.random.rand(settings.EMBEDDING_DIM).tolist()
+        """??????????????????"""
+        return _reg_text_embed(text)
 
     def generate_image_embedding_from_path(self, image_path: str) -> List[float]:
-        """从图片路径生成图片嵌入向量（使用CLIP，支持 MinIO）"""
-        global _clip_model, _clip_preprocess
-        clip_model, clip_preprocess = _init_clip_model()
-        if clip_model is not None and clip_preprocess is not None:
-            try:
-                import torch
-                device = "cuda" if gpu_manager.cuda_available else "cpu"
-                # 使用统一的图片读取函数（支持 MinIO）
-                image = _read_image_from_path(image_path)
-                if image is None:
-                    return np.random.rand(settings.EMBEDDING_DIM).tolist()
-                image_input = clip_preprocess(image).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    image_features = clip_model.encode_image(image_input)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                return image_features.cpu().numpy().flatten().tolist()
-            except Exception as e:
-                pass
-        # 降级到简单特征（像素均值）- 这会导致语义搜索失败！
-        try:
-            # 使用统一的图片读取函数（支持 MinIO）
-            img = _read_image_from_path(image_path)
-            if img is None:
-                return np.random.rand(settings.EMBEDDING_DIM).tolist()
-            img = img.resize((224, 224))
-            img_array = np.array(img)
-            features = img_array.mean(axis=(0, 1)).tolist()
-            embedding = np.zeros(settings.EMBEDDING_DIM)
-            embedding[:len(features)] = features
-            return embedding.tolist()
-        except Exception as e:
-            return np.random.rand(settings.EMBEDDING_DIM).tolist()
+        """????????????????????????? MinIO?"""
+        return _reg_image_embed_path(image_path)
 
     def generate_image_embedding(self, features: List[float]) -> List[float]:
-        """生成图片嵌入向量（兼容旧接口）"""
-        embedding = np.zeros(settings.EMBEDDING_DIM)
-        embedding[:len(features)] = features
-        return embedding.tolist()
+        """???????????????"""
+        return _reg_image_embed(features)
 
     def generate_video_embedding(self, frame_features: List[List[float]], audio_text: str) -> List[float]:
-        """生成视频嵌入向量"""
-        if not frame_features:
-            if audio_text:
-                return self.generate_text_embedding(audio_text)
-            else:
-                return np.random.rand(settings.EMBEDDING_DIM).tolist()
-        frame_mean = np.mean(frame_features, axis=0)
-        if audio_text:
-            audio_embedding = self.generate_text_embedding(audio_text)
-            embedding = (frame_mean + np.array(audio_embedding)) / 2
-        else:
-            embedding = frame_mean
-        return embedding.tolist()
+        """????????"""
+        return _reg_video_embed(frame_features, audio_text)
+
+
 
     def add_vector(self, vector: List[float], item_id: str, auto_save: bool = False,
                    file_id: str = None, vector_type: str = None, gid: str = None) -> str:
-        """添加向量（带元数据）"""
+        """??????????"""
         if not self.client:
             return item_id
         try:
