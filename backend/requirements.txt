@@ -55,6 +55,7 @@ clip-anytorch
 transformers>=4.40.0
 
 # Jina-CLIP-v2 推荐依赖
+einops
 timm
 
 # ============================================================

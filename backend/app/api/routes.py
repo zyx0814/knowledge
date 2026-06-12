@@ -8,7 +8,7 @@ import base64
 import numpy as np
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Optional
 from app.core.database import get_db, SessionLocal
 from app.services.file_service import FileService
 from app.services.file_processor import FileProcessor
@@ -586,7 +586,7 @@ async def qa(
 async def search_image(
     file: UploadFile = File(None),
     base64_data: str = Form(None),
-    gid: List[str] = Form(None),
+    gid: Optional[str] = Form(None),
     limit: int = 50,
     min_score: float = None,
     db: Session = Depends(get_db)
@@ -665,7 +665,7 @@ async def search_image(
 async def search_face(
     file: UploadFile = File(None),
     base64_data: str = Form(None),
-    gid: List[str] = Form(None),
+    gid: Optional[str] = Form(None),
     limit: int = 10,
     min_score: float = None,
     db: Session = Depends(get_db)
@@ -961,11 +961,11 @@ async def start_task(
     """启动后台任务"""
     from datetime import datetime
     task_id = str(uuid.uuid4())
-    task = task_service.create_task(db, task_id, task_type, params or {})
+    task_id = await task_service.create_task(task_type, params or {})
     return {
         "task_id": task_id,
-        "status": task.status,
-        "created_at": task.created_at.isoformat()
+        "status": "pending",
+        "created_at": None
     }
 @router.get("/task/{task_id}")
 async def get_task(
@@ -973,18 +973,21 @@ async def get_task(
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """获取任务状态"""
-    task = task_service.get_task(db, task_id)
+    task = await task_service.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     return {
-        "task_id": task.id,
-        "type": task.type,
-        "status": task.status,
-        "progress": task.progress,
-        "message": task.message,
-        "result": task.result,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None
+        "task": {
+            "id": task.get("id", ""),
+            "type": task.get("type", ""),
+            "status": task.get("status", ""),
+            "progress": task.get("progress", 0),
+            "message": task.get("message", ""),
+            "result": task.get("result"),
+            "error": task.get("error"),
+            "created_at": task.get("created_at"),
+            "completed_at": task.get("completed_at")
+        }
     }
 @router.post("/task/{task_id}/cancel")
 async def cancel_task(
@@ -992,10 +995,35 @@ async def cancel_task(
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """取消任务"""
-    success = task_service.cancel_task(db, task_id)
+    success = await task_service.cancel_task(task_id)
     if not success:
         raise HTTPException(status_code=404, detail="任务不存在或无法取消")
     return {"success": True, "message": "任务已取消"}
+
+@router.get("/tasks")
+async def get_tasks(
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """????????"""
+    tasks = await task_service.get_all_tasks()
+    return {
+        "tasks": [
+            {
+                "id": t.get("id", ""),
+                "type": t.get("type", ""),
+                "status": t.get("status", ""),
+                "progress": t.get("progress", 0),
+                "message": t.get("message", ""),
+                "result": t.get("result"),
+                "error": t.get("error"),
+                "created_at": t.get("created_at"),
+                "completed_at": t.get("completed_at")
+            }
+            for t in tasks
+        ]
+    }
+
+
 @router.post("/import/folder")
 async def import_folder(
     directory: str,
@@ -1004,8 +1032,7 @@ async def import_folder(
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """批量导入文件夹中的文件"""
-    task_id = str(uuid.uuid4())
-    task_service.create_task(db, task_id, "folder_import", {"directory": directory, "rid": rid, "gid": gid})
+    task_id = await task_service.create_task("folder_import", {"directory": directory, "rid": rid, "gid": gid})
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_in_executor(None, process_folder_import, task_id, directory, rid, gid)
@@ -1226,6 +1253,59 @@ def process_folder_import(task_id: str, directory: str, rid: str = None, gid: st
         })
     )
     db.close()
+
+@router.post("/file/batch_import_async")
+async def batch_import_async(
+    directory: str = Form(...),
+    rid: str = Form(None),
+    gid: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """????????????"""
+    task_id = await task_service.create_task("folder_import", {"directory": directory, "rid": rid, "gid": gid})
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_in_executor(None, process_folder_import, task_id, directory, rid, gid)
+    return {
+        "task_id": task_id,
+        "message": "??????????"
+    }
+
+
+@router.post("/file/batch_import")
+async def batch_import(
+    directory: str = Form(...),
+    rid: str = Form(None),
+    gid: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """????????????"""
+    result_holder = {}
+
+    def run_and_wait():
+        import asyncio as _asyncio
+        db2 = SessionLocal()
+        try:
+            _loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(_loop)
+            task_id_local = _loop.run_until_complete(
+                task_service.create_task("folder_import", {"directory": directory, "rid": rid, "gid": gid}))
+            process_folder_import(task_id_local, directory, rid, gid)
+            task = _loop.run_until_complete(task_service.get_task(task_id_local))
+            if task and task.get("result"):
+                result_holder["result"] = task["result"]
+            else:
+                result_holder["result"] = {"success_count": 0, "failed_count": 0, "failed_files": []}
+        except Exception as e:
+            result_holder["result"] = {"success_count": 0, "failed_count": 1, "failed_files": [{"error": str(e)}]}
+        finally:
+            db2.close()
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, run_and_wait)
+    return result_holder.get("result", {"success_count": 0, "failed_count": 0, "failed_files": []})
+
+
 @router.post("/import/url")
 async def import_from_url(
     url: str = Form(...),

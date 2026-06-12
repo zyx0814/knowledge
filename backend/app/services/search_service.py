@@ -143,6 +143,7 @@ class SearchService:
                 is_video_frame = True
             if file_type and file_type_from_id != file_type:
                 continue
+            if isinstance(gid, str): gid = [gid]
             if gid is not None and len(gid) > 0:
                 file = db.query(File).filter(File.id == file_id).first()
                 if not file or file.gid not in gid:
@@ -190,6 +191,7 @@ class SearchService:
             if not file_id:
                 continue
             # gid 过滤
+            if isinstance(gid, str): gid = [gid]
             if gid is not None and len(gid) > 0:
                 file = db.query(File).filter(File.id == file_id).first()
                 if not file or file.gid not in gid:

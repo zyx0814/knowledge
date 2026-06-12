@@ -138,29 +138,32 @@ def _init_jina_clip_v2(model_name="jinaai/jina-clip-v2"):
     if _model is not None and _model_type == cache_key:
         return _model, _preprocess
     try:
-        import torch
-        from transformers import AutoModel, AutoProcessor
+        import torch, shutil, glob
+        from transformers import AutoModel
         device = _get_device()
         local_path = os.path.join(settings.MODELS_DIR, "jina_clip", model_name.replace("/", "_"))
-        if os.path.exists(local_path):
-            try:
-                _model = AutoModel.from_pretrained(local_path, trust_remote_code=True).to(device)
-                _model.eval()
-                _preprocess = AutoProcessor.from_pretrained(local_path, trust_remote_code=True)
-                _model_type = cache_key
-                return _model, _preprocess
-            except Exception:
-                pass
-        _model = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
+        if not os.path.exists(local_path) or not os.path.exists(os.path.join(local_path, "model.safetensors")):
+            return None, None
+        
+        # Pre-populate the HuggingFace cache with implementation files
+        # so transformers can find them offline
+        hf_cache = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules")
+        cache_repo = model_name.replace("/", "_").replace("-", "_hyphen_")
+        cache_dir = os.path.join(hf_cache, cache_repo)
+        os.makedirs(cache_dir, exist_ok=True)
+        for py_file in glob.glob(os.path.join(local_path, "*.py")):
+            dest = os.path.join(cache_dir, os.path.basename(py_file))
+            if not os.path.exists(dest):
+                shutil.copy2(py_file, dest)
+        
+        # Set offline mode to prevent any network access
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        
+        _model = AutoModel.from_pretrained(local_path, trust_remote_code=True).to(device)
         _model.eval()
-        _preprocess = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        _preprocess = True  # Jina-CLIP-v2: encode_text()/encode_image() handle preprocessing internally
         _model_type = cache_key
-        os.makedirs(local_path, exist_ok=True)
-        try:
-            _model.save_pretrained(local_path)
-            _preprocess.save_pretrained(local_path)
-        except Exception:
-            pass
         return _model, _preprocess
     except Exception:
         return None, None
@@ -242,6 +245,7 @@ def _init_weclip(model_name):
 # --- 统一嵌入生成接口 ---
 
 def generate_text_embedding(text: str, model_name: str = None) -> List[float]:
+    import numpy as np
     """生成文本嵌入向量。文本和图像在同一向量空间，可直接搜图。"""
     import torch
     if model_name is None:
@@ -292,14 +296,20 @@ def generate_text_embedding(text: str, model_name: str = None) -> List[float]:
 
     # Jina-CLIP-v2
     elif model_name == "jinaai/jina-clip-v2":
-        model, processor = _init_jina_clip_v2(model_name)
-        if model and processor:
+        model, _ = _init_jina_clip_v2(model_name)
+        if model:
             try:
-                inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True).to(device)
                 with torch.no_grad():
-                    f = model.get_text_features(**inputs)
-                f = f / f.norm(dim=-1, keepdim=True)
-                emb = f.cpu().numpy().flatten().tolist()
+                    f = model.encode_text(text, task="retrieval.query", truncate_dim=None)
+                if isinstance(f, torch.Tensor):
+                    f = f / f.norm(dim=-1, keepdim=True)
+                    emb = f.cpu().numpy().flatten().tolist()
+                else:
+                    arr = np.array(f)
+                    norm = np.linalg.norm(arr)
+                    if norm > 0:
+                        arr = arr / norm
+                    emb = arr.flatten().tolist()
             except Exception:
                 pass
 
@@ -329,6 +339,7 @@ def generate_text_embedding(text: str, model_name: str = None) -> List[float]:
 
 def generate_image_embedding_from_path(image_path: str, model_name: str = None) -> List[float]:
     """从图片路径生成图像嵌入向量。与文本向量在同一空间，天然支持以文搜图。"""
+    import numpy as np
     import torch
     if model_name is None:
         model_name = settings.EMBEDDING_MODEL
@@ -383,16 +394,23 @@ def generate_image_embedding_from_path(image_path: str, model_name: str = None) 
 
     # Jina-CLIP-v2
     elif model_name == "jinaai/jina-clip-v2":
-        model, processor = _init_jina_clip_v2(model_name)
-        if model and processor:
+        model, _ = _init_jina_clip_v2(model_name)
+        if model:
             try:
                 img = _read_image_from_path(image_path)
                 if img:
-                    inp = processor(images=img, return_tensors="pt").to(device)
                     with torch.no_grad():
-                        f = model.get_image_features(**inp)
-                    f = f / f.norm(dim=-1, keepdim=True)
-                    emb = f.cpu().numpy().flatten().tolist()
+                        f = model.encode_image(img, truncate_dim=None)
+                    if isinstance(f, torch.Tensor):
+                        f = f / f.norm(dim=-1, keepdim=True)
+                        emb = f.cpu().numpy().flatten().tolist()
+                    else:
+                        import numpy as np
+                        arr = np.array(f)
+                        norm = np.linalg.norm(arr)
+                        if norm > 0:
+                            arr = arr / norm
+                        emb = arr.flatten().tolist()
             except Exception:
                 pass
 
