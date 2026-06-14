@@ -49,27 +49,28 @@ RUN python3.10 -m pip install --upgrade pip setuptools wheel
 
 # 创建非root用户（安全最佳实践）
 RUN useradd -m -u 1000 appuser \
-    && mkdir -p /app/data /app/vector_db /app/uploads /app/temp /app/storage \
-    && chown -R appuser:appuser /app
+    && mkdir -p /app/data /app/vector_db /app/uploads /app/temp /app/storage /opt/venv \
+    && chown -R appuser:appuser /app /opt/venv
 
 # 切换到非root用户
 USER appuser
 
-# 设置Python虚拟环境
-ENV VIRTUAL_ENV=/app/venv
+# 设置Python虚拟环境（放在/app之外，避免被挂载覆盖）
+ENV VIRTUAL_ENV=/opt/venv
 RUN python3.10 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # 复制依赖文件
-COPY --chown=appuser:appuser backend/requirements_gpu.txt .
+COPY --chown=appuser:appuser backend/requirements_gpu.txt /tmp/requirements_gpu.txt
 
 # 安装Python依赖（GPU版本）
 # 根据架构选择包：GPU版本仅支持x86_64，ARM64使用CPU版本
 RUN if [ "$(uname -m)" = "aarch64" ]; then \
-        sed -i 's/faiss-gpu/faiss-cpu/g' requirements_gpu.txt && \
-        sed -i 's/onnxruntime-gpu/onnxruntime/g' requirements_gpu.txt; \
+        sed -i 's/faiss-gpu/faiss-cpu/g' /tmp/requirements_gpu.txt && \
+        sed -i 's/onnxruntime-gpu/onnxruntime/g' /tmp/requirements_gpu.txt; \
     fi && \
-    pip install --no-cache-dir -r requirements_gpu.txt
+    pip install --no-cache-dir -r /tmp/requirements_gpu.txt && \
+    rm /tmp/requirements_gpu.txt
 
 # 复制后端代码
 COPY --chown=appuser:appuser backend/ .
