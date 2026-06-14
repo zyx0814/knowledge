@@ -9,6 +9,9 @@ WORKDIR /app
 ENV TZ=Asia/Shanghai
 ENV DEBIAN_FRONTEND=noninteractive
 
+# 设置HuggingFace国内镜像（加速模型下载）
+ENV HF_ENDPOINT=https://hf-mirror.com
+
 # 设置CUDA环境变量
 ENV CUDA_HOME=/usr/local/cuda
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
