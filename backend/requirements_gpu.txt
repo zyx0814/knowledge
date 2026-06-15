@@ -39,8 +39,8 @@ psycopg2-binary
 insightface
 opencv-python
 
-# FAISS - GPU
-faiss-gpu
+# FAISS - GPU (CUDA 12.x)
+faiss-gpu-cu12[fix-cuda]
 
 # ONNX Runtime - GPU
 onnxruntime-gpu
