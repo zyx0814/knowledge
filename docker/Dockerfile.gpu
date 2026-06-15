@@ -1,6 +1,6 @@
 # 后端GPU版Dockerfile
-# 基于NVIDIA CUDA 12.5 + cuDNN + Ubuntu 22.04
-FROM nvidia/cuda:12.5.1-cudnn-runtime-ubuntu22.04
+# 基于NVIDIA CUDA 12.6 + cuDNN + Ubuntu 24.04
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 # 设置工作目录
 WORKDIR /app
@@ -27,10 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
     # Python环境
-    python3.10 \
-    python3.10-dev \
+    python3 \
+    python3-dev \
     python3-pip \
-    python3.10-venv \
+    python3-venv \
     # 图像处理依赖
     libgl1 \
     libglib2.0-0 \
@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 更新pip
-RUN python3.10 -m pip install --upgrade pip setuptools wheel
+RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # 创建非root用户（安全最佳实践）
 RUN useradd -m -u 1000 appuser \
@@ -57,7 +57,7 @@ USER appuser
 
 # 设置Python虚拟环境（放在/app之外，避免被挂载覆盖）
 ENV VIRTUAL_ENV=/opt/venv
-RUN python3.10 -m venv $VIRTUAL_ENV
+RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # 复制依赖文件
