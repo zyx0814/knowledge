@@ -66,6 +66,12 @@ RUN pip install --upgrade pip setuptools wheel
 # 复制依赖文件
 COPY --chown=appuser:appuser backend/requirements_gpu.txt /tmp/requirements_gpu.txt
 
+# 先安装与CUDA 12.6兼容的nvidia库，确保faiss-gpu使用正确版本
+RUN pip install --no-cache-dir \
+    'nvidia-cuda-runtime-cu12>=12.6,<13' \
+    'nvidia-cublas-cu12>=12.6,<13' \
+    'nvidia-curand-cu12>=10.3.7,<11'
+
 # 安装Python依赖（GPU版本）
 # 根据架构选择包：GPU版本仅支持x86_64，ARM64使用CPU版本
 RUN if [ "$(uname -m)" = "aarch64" ]; then \
