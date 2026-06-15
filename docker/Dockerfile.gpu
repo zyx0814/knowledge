@@ -44,9 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# 更新pip（Ubuntu 24.04需要--break-system-packages绕过PEP 668限制）
-RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/* && \
-    python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
+# 更新pip（Ubuntu 24.04通过apt安装的pip无法直接升级，跳过系统级升级）
+RUN apt-get update && apt-get install -y python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
 
 # 创建非root用户（安全最佳实践）
 RUN useradd -m -u 1000 appuser \
@@ -60,6 +59,9 @@ USER appuser
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# 在虚拟环境中升级pip
+RUN pip install --upgrade pip setuptools wheel
 
 # 复制依赖文件
 COPY --chown=appuser:appuser backend/requirements_gpu.txt /tmp/requirements_gpu.txt
