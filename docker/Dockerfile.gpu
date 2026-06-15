@@ -1,6 +1,6 @@
 # 后端GPU版Dockerfile
-# 基于NVIDIA CUDA 12.1 + cuDNN 8 + Ubuntu 22.04
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# 基于NVIDIA CUDA 12.6 + cuDNN 8 + Ubuntu 22.04
+FROM nvidia/cuda:12.6.0-cudnn8-runtime-ubuntu22.04
 
 # 设置工作目录
 WORKDIR /app
