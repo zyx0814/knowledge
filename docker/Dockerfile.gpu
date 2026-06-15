@@ -47,8 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 更新pip（Ubuntu 24.04通过apt安装的pip无法直接升级，跳过系统级升级）
 RUN apt-get update && apt-get install -y python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
 
-# 创建非root用户（安全最佳实践）
-RUN useradd -m -u 1000 appuser \
+# 创建非root用户（安全最佳实践）- 使用UID 1001避免与基础镜像冲突
+RUN useradd -m -u 1001 appuser \
     && mkdir -p /app/data /app/vector_db /app/uploads /app/temp /app/storage /opt/venv \
     && chown -R appuser:appuser /app /opt/venv
 
