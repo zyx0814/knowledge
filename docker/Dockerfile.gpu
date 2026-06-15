@@ -12,10 +12,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 # 设置HuggingFace国内镜像（加速模型下载）
 ENV HF_ENDPOINT=https://hf-mirror.com
 
-# 设置CUDA环境变量
+# 设置CUDA环境变量 - 优先使用系统CUDA库，避免pip包的冲突
 ENV CUDA_HOME=/usr/local/cuda
-ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH
+ENV LD_PRELOAD=/usr/local/cuda/lib64/libcublas.so.12
 ENV PATH=/usr/local/cuda/bin:$PATH
+ENV FORCE_CUDA=1
 
 # 更新系统并安装基础依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -65,12 +67,6 @@ RUN pip install --upgrade pip setuptools wheel
 
 # 复制依赖文件
 COPY --chown=appuser:appuser backend/requirements_gpu.txt /tmp/requirements_gpu.txt
-
-# 先安装与CUDA 12.6兼容的nvidia库，确保faiss-gpu使用正确版本
-RUN pip install --no-cache-dir \
-    'nvidia-cuda-runtime-cu12>=12.6,<13' \
-    'nvidia-cublas-cu12>=12.6,<13' \
-    'nvidia-curand-cu12>=10.3.7,<11'
 
 # 安装Python依赖（GPU版本）
 # 根据架构选择包：GPU版本仅支持x86_64，ARM64使用CPU版本
