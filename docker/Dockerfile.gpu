@@ -44,8 +44,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# 更新pip
-RUN python3 -m pip install --upgrade pip setuptools wheel
+# 更新pip（Ubuntu 24.04需要--break-system-packages绕过PEP 668限制）
+RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/* && \
+    python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
 
 # 创建非root用户（安全最佳实践）
 RUN useradd -m -u 1000 appuser \
