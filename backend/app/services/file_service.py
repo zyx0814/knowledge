@@ -213,7 +213,9 @@ class FileService:
         """获取临时文件路径"""
         temp_dir = os.path.join(settings.TEMP_DIR)
         os.makedirs(temp_dir, exist_ok=True)
-        temp_file_name = f"{str(uuid.uuid4())}_{file_name}"
+        # 清理文件名中的路径分隔符，只保留纯文件名部分
+        safe_file_name = os.path.basename(file_name).replace(os.sep, '_').replace('/', '_')
+        temp_file_name = f"{str(uuid.uuid4())}_{safe_file_name}"
         return os.path.join(temp_dir, temp_file_name)
     @staticmethod
     def clean_temp_file(file_path: str):

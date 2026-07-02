@@ -337,7 +337,6 @@ async def upload_file(
                 db_file.storage_path = permanent_path
                 db.commit()
         from app.models.db import TextChunk, ImageFrame, AudioTranscript
-        import uuid
         if file_type == "document":
             chunks = file_processor.process_document(temp_file_path, subformat)
             for i, chunk in enumerate(chunks):
@@ -575,18 +574,89 @@ async def search(
     return _enrich_search_results(db, results)
 @router.post("/qa")
 async def qa(
-    question: str,
-    file_type: str = None,
+    request: Dict[str, Any],
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """知识库问答接口"""
-    result = qa_service.generate_answer(db, question, file_type)
-    return result
+    question = request.get("question", "")
+    file_type = request.get("file_type", None)
+    
+    search_results = search_service.hybrid_search(db, question, file_type, limit=10)
+    enriched_results = _enrich_search_results(db, search_results)
+    
+    has_image_results = any(r.get('type') == 'image' for r in enriched_results)
+    
+    context = "\n".join([
+        f"[{r.get('type', '未知')}: {r.get('name', '未知')}]"
+        for r in enriched_results
+    ])
+    
+    if not context:
+        context = "知识库为空或未找到相关内容。"
+    
+    if has_image_results:
+        prompt = f"""
+        你是一个基于本地知识库的问答助手。用户正在搜索图片相关的内容。
+        
+        知识库中找到的相关文件：
+        {context}
+        
+        用户问题：{question}
+        
+        请根据以上信息回答：
+        1. 如果找到了图片，请说明找到了多少张相关图片
+        2. 回答要简洁明了
+        3. 如果没有足够信息，请建议用户查看参考来源
+        """
+    else:
+        prompt = f"""
+        你是一个基于本地知识库的问答助手，以下是相关的知识库内容：
+        {context}
+        
+        请根据以上内容回答用户的问题：{question}
+        
+        要求：
+        1. 基于知识库内容回答，不要生成知识库外的信息
+        2. 回答要准确、简洁
+        3. 如果知识库中没有相关内容，请明确说明
+        """
+    
+    answer = ""
+    try:
+        response = requests.post(
+            f"{settings.OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": settings.LLM_MODEL,
+                "prompt": prompt.strip(),
+                "stream": False
+            },
+            timeout=30
+        )
+        if response.status_code == 200:
+            data = response.json()
+            answer = data.get("response", "")
+    except Exception as e:
+        pass
+    
+    if not answer or answer.strip() == "" or "无法生成准确的答案" in answer or "抱歉，无法生成答案" in answer:
+        if has_image_results:
+            answer = f"在知识库中找到了 {len([r for r in enriched_results if r.get('type') == 'image'])} 张相关图片，请查看参考来源。"
+        elif enriched_results:
+            answer = f"在知识库中找到了 {len(enriched_results)} 个相关文件，请查看参考来源了解详情。"
+        else:
+            answer = "在知识库中未找到相关内容。"
+    
+    return {
+        "answer": answer,
+        "sources": enriched_results,
+        "context": context,
+        "has_images": has_image_results
+    }
 @router.post("/search/image")
 async def search_image(
     file: UploadFile = File(None),
     base64_data: str = Form(None),
-    gid: Optional[str] = Form(None),
+    gid: List[str] = Form(None),
     limit: int = 50,
     min_score: float = None,
     db: Session = Depends(get_db)
@@ -598,7 +668,8 @@ async def search_image(
     try:
         temp_file_path = None
         if file:
-            temp_file_path = f"{settings.TEMP_DIR}/{file.filename}"
+            safe_filename = os.path.basename(file.filename).replace(os.sep, '_').replace('/', '_')
+            temp_file_path = f"{settings.TEMP_DIR}/{safe_filename}"
             os.makedirs(settings.TEMP_DIR, exist_ok=True)
             with open(temp_file_path, "wb") as f:
                 content = await file.read()
@@ -651,7 +722,7 @@ async def search_image(
             face_service = FaceService()
             for face_feature in result["faces"]:
                 face_embedding = np.array(face_feature['embedding'])
-                face_results = search_service.face_search(db, face_embedding, limit=limit, min_score=min_score)
+                face_results = search_service.face_search(db, face_embedding, gid=gid, limit=limit, min_score=min_score)
                 search_results.extend(face_results)
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -665,7 +736,7 @@ async def search_image(
 async def search_face(
     file: UploadFile = File(None),
     base64_data: str = Form(None),
-    gid: Optional[str] = Form(None),
+    gid: List[str] = Form(None),
     limit: int = 10,
     min_score: float = None,
     db: Session = Depends(get_db)
@@ -677,7 +748,8 @@ async def search_face(
     try:
         temp_file_path = None
         if file:
-            temp_file_path = f"{settings.TEMP_DIR}/{file.filename}"
+            safe_filename = os.path.basename(file.filename).replace(os.sep, '_').replace('/', '_')
+            temp_file_path = f"{settings.TEMP_DIR}/{safe_filename}"
             os.makedirs(settings.TEMP_DIR, exist_ok=True)
             with open(temp_file_path, "wb") as f:
                 content = await file.read()
@@ -783,7 +855,8 @@ async def add_face(
     try:
         temp_file_path = None
         if file:
-            temp_file_path = f"{settings.TEMP_DIR}/{file.filename}"
+            safe_filename = os.path.basename(file.filename).replace(os.sep, '_').replace('/', '_')
+            temp_file_path = f"{settings.TEMP_DIR}/{safe_filename}"
             os.makedirs(settings.TEMP_DIR, exist_ok=True)
             with open(temp_file_path, "wb") as f:
                 content = await file.read()
@@ -890,15 +963,31 @@ async def delete_file(
 ) -> Dict[str, Any]:
     """删除文件及其相关数据"""
     try:
-        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
+        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript, Face
         file = db.query(File).filter(File.id == file_id).first()
         if not file:
             raise HTTPException(status_code=404, detail="文件不存在")
+        # 清理向量索引
+        vector_service.delete_vectors_by_file_id(file_id)
+        # 清理人脸向量索引
+        try:
+            from app.services.face_service import FaceService
+            face_service = FaceService()
+            faces = db.query(Face).filter(Face.file_id == file_id).all()
+            for face in faces:
+                face_service.face_index.remove(str(face.id))
+            if faces:
+                face_service.face_index.save()
+        except Exception as e:
+            pass  # 人脸索引清理失败不阻塞删除
+        # 删除数据库记录
         db.query(TextChunk).filter(TextChunk.file_id == file_id).delete()
         db.query(ImageFrame).filter(ImageFrame.file_id == file_id).delete()
         db.query(AudioTranscript).filter(AudioTranscript.file_id == file_id).delete()
         db.delete(file)
         db.commit()
+        # 保存向量索引
+        vector_service.save_index()
         return {"success": True, "message": "文件删除成功"}
     except HTTPException:
         raise
@@ -912,17 +1001,34 @@ async def batch_delete_files(
 ) -> Dict[str, Any]:
     """批量删除文件"""
     try:
-        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
+        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript, Face
+        from app.services.face_service import FaceService
+        face_service = FaceService()
         deleted_count = 0
+        any_face_deleted = False
         for file_id in file_ids:
             file = db.query(File).filter(File.id == file_id).first()
             if file:
+                # 清理向量索引
+                vector_service.delete_vectors_by_file_id(file_id)
+                # 清理人脸向量索引
+                try:
+                    faces = db.query(Face).filter(Face.file_id == file_id).all()
+                    for face in faces:
+                        face_service.face_index.remove(str(face.id))
+                    if faces:
+                        any_face_deleted = True
+                except Exception:
+                    pass
                 db.query(TextChunk).filter(TextChunk.file_id == file_id).delete()
                 db.query(ImageFrame).filter(ImageFrame.file_id == file_id).delete()
                 db.query(AudioTranscript).filter(AudioTranscript.file_id == file_id).delete()
                 db.delete(file)
                 deleted_count += 1
         db.commit()
+        vector_service.save_index()
+        if any_face_deleted:
+            face_service.face_index.save()
         return {"success": True, "deleted_count": deleted_count}
     except Exception as e:
         db.rollback()
@@ -934,20 +1040,37 @@ async def delete_files_by_rid(
 ) -> Dict[str, Any]:
     """通过 rid 删除所有相关文件"""
     try:
-        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript
+        from app.models.db import File, TextChunk, ImageFrame, AudioTranscript, Face
+        from app.services.face_service import FaceService
+        face_service = FaceService()
         # 获取该 rid 下的所有文件
         files = db.query(File).filter(File.rid == rid).all()
         if not files:
             return {"success": True, "deleted_count": 0, "message": "没有找到该 rid 下的文件"}
         deleted_count = 0
+        any_face_deleted = False
         for file in files:
             file_id = str(file.id)
+            # 清理向量索引
+            vector_service.delete_vectors_by_file_id(file_id)
+            # 清理人脸向量索引
+            try:
+                faces = db.query(Face).filter(Face.file_id == file_id).all()
+                for face in faces:
+                    face_service.face_index.remove(str(face.id))
+                if faces:
+                    any_face_deleted = True
+            except Exception:
+                pass
             db.query(TextChunk).filter(TextChunk.file_id == file_id).delete()
             db.query(ImageFrame).filter(ImageFrame.file_id == file_id).delete()
             db.query(AudioTranscript).filter(AudioTranscript.file_id == file_id).delete()
             db.delete(file)
             deleted_count += 1
         db.commit()
+        vector_service.save_index()
+        if any_face_deleted:
+            face_service.face_index.save()
         return {"success": True, "deleted_count": deleted_count, "message": f"成功删除 {deleted_count} 个文件"}
     except Exception as e:
         db.rollback()

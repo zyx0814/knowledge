@@ -4,6 +4,7 @@ import uuid
 import hashlib
 import numpy as np
 import faiss
+import threading
 from typing import List, Dict, Any, Optional
 from config.config import settings
 from app.core.gpu_utils import gpu_manager
@@ -26,6 +27,7 @@ except ImportError:
 # 全局CLIP模型（用于跨模态检索）
 _clip_model = None
 _clip_preprocess = None
+_clip_model_lock = threading.Lock()
 def _read_image_from_path(image_path: str):
     """从路径读取图片，支持本地路径和 MinIO 路径"""
     from PIL import Image
@@ -55,51 +57,47 @@ def _init_clip_model():
     global _clip_model, _clip_preprocess
     if _clip_model is not None:
         return _clip_model, _clip_preprocess
-    try:
-        import torch
-        from clip import clip
-        device = "cuda" if gpu_manager.cuda_available else "cpu"
-        model_name = "ViT-B/32"
-        # 首先尝试从本地目录加载
-        local_model_path = os.path.join(settings.MODELS_DIR, 'clip', model_name)
-        local_clip_path = os.path.join(local_model_path, 'clip.pt')
-        if os.path.exists(local_clip_path):
+    with _clip_model_lock:
+        if _clip_model is not None:
+            return _clip_model, _clip_preprocess
+        try:
+            import torch
+            from clip import clip
+            device = "cuda" if gpu_manager.cuda_available else "cpu"
+            model_name = "ViT-B/32"
+            local_model_path = os.path.join(settings.MODELS_DIR, 'clip', model_name)
+            local_clip_path = os.path.join(local_model_path, 'clip.pt')
+            if os.path.exists(local_clip_path):
+                try:
+                    model_state_dict = torch.load(local_clip_path, map_location=device)
+                    from clip.model import CLIP, build_model
+                    _clip_model = build_model(model_state_dict['model_state_dict']).to(device)
+                    _clip_model.eval()
+                    from clip.simple_tokenizer import SimpleTokenizer
+                    _clip_preprocess = clip._transform(model_state_dict.get('input_resolution', 224))
+                    return _clip_model, _clip_preprocess
+                except Exception:
+                    pass
+            _clip_model, _clip_preprocess = clip.load(model_name, device=device)
+            save_path = os.path.join(settings.MODELS_DIR, 'clip', model_name)
+            os.makedirs(save_path, exist_ok=True)
+            save_clip_path = os.path.join(save_path, 'clip.pt')
             try:
-                # 加载本地模型
-                model_state_dict = torch.load(local_clip_path, map_location=device)
-                # 创建模型
-                from clip.model import CLIP, build_model
-                _clip_model = build_model(model_state_dict['model_state_dict']).to(device)
-                _clip_model.eval()
-                # 创建预处理
-                from clip.simple_tokenizer import SimpleTokenizer
-                _clip_preprocess = clip._transform(model_state_dict.get('input_resolution', 224))
-                return _clip_model, _clip_preprocess
+                torch.save({
+                    'model_state_dict': _clip_model.state_dict(),
+                    'input_resolution': _clip_model.visual.input_resolution,
+                    'context_length': _clip_model.context_length,
+                    'vocab_size': _clip_model.vocab_size
+                }, save_clip_path)
             except Exception:
                 pass
-        # 默认方式加载（自动下载）
-        _clip_model, _clip_preprocess = clip.load(model_name, device=device)
-        # 保存到本地目录以便下次使用
-        save_path = os.path.join(settings.MODELS_DIR, 'clip', model_name)
-        os.makedirs(save_path, exist_ok=True)
-        save_clip_path = os.path.join(save_path, 'clip.pt')
-        try:
-            torch.save({
-                'model_state_dict': _clip_model.state_dict(),
-                'input_resolution': _clip_model.visual.input_resolution,
-                'context_length': _clip_model.context_length,
-                'vocab_size': _clip_model.vocab_size
-            }, save_clip_path)
+            return _clip_model, _clip_preprocess
+        except ImportError:
+            return None, None
+        except RuntimeError:
+            raise
         except Exception:
-            pass
-        return _clip_model, _clip_preprocess
-
-    except ImportError:
-        return None, None
-    except RuntimeError:
-        raise
-    except Exception:
-        return None, None
+            return None, None
 
 class FAISSVectorService:
     """FAISS 向量服务实现"""
@@ -112,12 +110,22 @@ class FAISSVectorService:
         self._pending_vectors = []
         self._pending_ids = []
         self._dirty = False
-        self._save_interval = 1000
         self._add_count = 0
+        # 从配置中读取保存间隔和批量大小
+        self._save_interval = getattr(settings, 'VECTOR_INDEX_BATCH_SIZE', 100)
+        self._auto_save_interval = getattr(settings, 'VECTOR_INDEX_SAVE_INTERVAL', 30)
+        # Tombstone 删除机制：删除时只标记，搜索时过滤，避免全量重建
+        self._deleted_indices: set = set()
+        self._tombstone_threshold = 0.1  # 删除比例超过 10% 时触发物理压缩
         self.use_gpu = getattr(settings, 'USE_GPU', False) and gpu_manager.faiss_gpu_available
         self.gpu_resources = None
         self.gpu_index = None
         self.cpu_index = None
+        self._lock = threading.Lock()
+        # 定时保存相关
+        self._last_save_time = 0
+        self._save_thread = None
+        self._shutdown_event = threading.Event()
         if os.path.exists(self.index_path):
             self.cpu_index = faiss.read_index(self.index_path)
             self.id_map = np.load(self.id_map_path, allow_pickle=True).item()
@@ -130,6 +138,8 @@ class FAISSVectorService:
             if self.use_gpu:
                 self._move_to_gpu()
             self.index = self.gpu_index if self.gpu_index else self.cpu_index
+        # 启动自动保存线程
+        self._start_auto_save()
 
     def _move_to_gpu(self):
         """将索引移动到 GPU"""
@@ -206,121 +216,183 @@ class FAISSVectorService:
     def add_vector(self, vector: List[float], item_id: str, auto_save: bool = False, 
                    file_id: str = None, vector_type: str = None, gid: str = None) -> int:
         """添加单个向量到向量库"""
-        vector_np = np.array([vector], dtype=np.float32)
-        idx = self.index.ntotal
-        if hasattr(self.index, 'train') and not self.index.is_trained and idx > 0:
-            self.index.train(vector_np)
-        self.index.add(vector_np)
-        self.id_map[idx] = item_id
-        self._dirty = True
-        self._add_count += 1
-        if auto_save and self._add_count % self._save_interval == 0:
-            self._save_index()
-        return idx
+        with self._lock:
+            vector_np = np.array([vector], dtype=np.float32)
+            idx = self.index.ntotal
+            if hasattr(self.index, 'train') and not self.index.is_trained and idx > 0:
+                self.index.train(vector_np)
+            self.index.add(vector_np)
+            self.id_map[idx] = item_id
+            self._dirty = True
+            self._add_count += 1
+            # 移除自动保存逻辑，改用定时保存
+            return idx
 
     def add_vectors_batch(self, vectors: List[List[float]], item_ids: List[str],
                           file_ids: List[str] = None, vector_types: List[str] = None) -> List[int]:
         """批量添加向量（性能优化）"""
         if not vectors or not item_ids or len(vectors) != len(item_ids):
             return []
-        vectors_np = np.array(vectors, dtype=np.float32)
-        start_idx = self.index.ntotal
-        if hasattr(self.index, 'train') and not self.index.is_trained and start_idx == 0:
-            self.index.train(vectors_np)
-        self.index.add(vectors_np)
-        indices = []
-        for i, item_id in enumerate(item_ids):
-            self.id_map[start_idx + i] = item_id
-            indices.append(start_idx + i)
-        self._dirty = True
-        self._add_count += len(vectors)
-        if self._add_count % self._save_interval >= len(vectors):
-            self._save_index()
-        return indices
+        with self._lock:
+            vectors_np = np.array(vectors, dtype=np.float32)
+            start_idx = self.index.ntotal
+            if hasattr(self.index, 'train') and not self.index.is_trained and start_idx == 0:
+                self.index.train(vectors_np)
+            self.index.add(vectors_np)
+            indices = []
+            for i, item_id in enumerate(item_ids):
+                self.id_map[start_idx + i] = item_id
+                indices.append(start_idx + i)
+            self._dirty = True
+            self._add_count += len(vectors)
+            # 移除自动保存逻辑，改用定时保存
+            return indices
 
-    def _save_index(self):
-        """保存索引到磁盘"""
-        if not self._dirty:
-            return
-        try:
-            self._save_to_cpu()
-            faiss.write_index(self.cpu_index, self.index_path)
-            np.save(self.id_map_path, self.id_map)
-            self._dirty = False
-        except Exception as e:
-            pass
+    def _start_auto_save(self):
+        """启动自动保存线程"""
+        import time
+        def auto_save_worker():
+            while not self._shutdown_event.is_set():
+                time.sleep(self._auto_save_interval)
+                if self._dirty:
+                    self._save_index()
+        self._save_thread = threading.Thread(target=auto_save_worker, daemon=True)
+        self._save_thread.start()
+
+    def _save_index(self, force: bool = False):
+        """保存索引到磁盘（保存前自动压缩 tombstone）"""
+        with self._lock:
+            if not self._dirty and not force:
+                return
+            try:
+                # 保存前先压缩，确保磁盘数据干净
+                self._maybe_compact()
+                self._save_to_cpu()
+                faiss.write_index(self.cpu_index, self.index_path)
+                np.save(self.id_map_path, self.id_map)
+                self._dirty = False
+                import time
+                self._last_save_time = time.time()
+            except Exception as e:
+                pass
 
     def search_vectors(self, query_vector: List[float], top_k: int = 10) -> List[Dict[str, Any]]:
-        """搜索相似向量"""
-        if self.index.ntotal == 0:
-            return []
-        query_np = np.array([query_vector], dtype=np.float32)
-        try:
-            distances, indices = self.index.search(query_np, min(top_k, self.index.ntotal))
-        except Exception as e:
-            return []
-        results = []
-        for i in range(len(indices[0])):
-            idx = indices[0][i]
-            distance = distances[0][i]
-            if idx != -1 and idx in self.id_map:
-                results.append({
-                    "id": self.id_map[idx],
-                    "distance": float(distance),
-                    "score": float(1.0 / (1.0 + distance))
-                })
-        return results
+        """搜索相似向量（自动过滤 tombstone 标记的已删除项）"""
+        with self._lock:
+            if self.index.ntotal == 0:
+                return []
+            query_np = np.array([query_vector], dtype=np.float32)
+            try:
+                expanded_k = min(top_k + len(self._deleted_indices) + 10, self.index.ntotal)
+                distances, indices = self.index.search(query_np, expanded_k)
+            except Exception as e:
+                return []
+            results = []
+            for i in range(len(indices[0])):
+                idx = indices[0][i]
+                distance = distances[0][i]
+                if idx == -1 or idx in self._deleted_indices:
+                    continue
+                if idx in self.id_map:
+                    results.append({
+                        "id": self.id_map[idx],
+                        "distance": float(distance),
+                        "score": float(1.0 / (1.0 + distance))
+                    })
+                if len(results) >= top_k:
+                    break
+            return results
 
     def delete_vector(self, item_id: str) -> bool:
-        """删除指定向量"""
-        indices_to_remove = [idx for idx, id_val in self.id_map.items() if id_val == item_id]
-        if not indices_to_remove:
-            return False
-        for idx in sorted(indices_to_remove, reverse=True):
-            del self.id_map[idx]
-        # 需要重建索引
-        self._rebuild_index()
-        return True
-    
+        """删除指定向量（tombstone 标记，O(k)，k=匹配数）"""
+        with self._lock:
+            indices_to_remove = [idx for idx, id_val in self.id_map.items() if id_val == item_id]
+            if not indices_to_remove:
+                return False
+            for idx in indices_to_remove:
+                del self.id_map[idx]
+                self._deleted_indices.add(idx)
+            self._dirty = True
+            self._maybe_compact()
+            return True
+
     def delete_vectors_by_file_id(self, file_id: str) -> int:
-        """根据 file_id 删除所有相关向量"""
-        # 向量 ID 格式: chunk_{file_id}_{index}, image_{file_id}, video_frame_{file_id}_{timestamp} 等
-        indices_to_remove = []
-        for idx, id_val in self.id_map.items():
-            # 检查向量ID是否包含该file_id
-            if id_val.startswith(f"chunk_{file_id}_") or \
-               id_val.startswith(f"image_{file_id}") or \
-               id_val.startswith(f"video_frame_{file_id}_") or \
-               id_val.startswith(f"video_audio_{file_id}_"):
-                indices_to_remove.append(idx)
-        if not indices_to_remove:
-            return 0
-        for idx in sorted(indices_to_remove, reverse=True):
-            del self.id_map[idx]
-        # 需要重建索引
-        self._rebuild_index()
-        return len(indices_to_remove)
+        """根据 file_id 删除所有相关向量（tombstone 标记，避免全量重建）"""
+        with self._lock:
+            indices_to_remove = []
+            for idx, id_val in self.id_map.items():
+                if id_val.startswith(f"chunk_{file_id}_") or \
+                   id_val.startswith(f"image_{file_id}") or \
+                   id_val.startswith(f"video_frame_{file_id}_") or \
+                   id_val.startswith(f"video_audio_{file_id}_"):
+                    indices_to_remove.append(idx)
+            if not indices_to_remove:
+                return 0
+            for idx in indices_to_remove:
+                del self.id_map[idx]
+                self._deleted_indices.add(idx)
+            self._dirty = True
+            self._maybe_compact()
+            return len(indices_to_remove)
+
+    def _maybe_compact(self):
+        """检查 tombstone 比例，超过阈值时触发物理重建"""
+        total = self.index.ntotal
+        if total == 0:
+            return
+        deleted_count = len(self._deleted_indices)
+        ratio = deleted_count / total
+        if ratio >= self._tombstone_threshold:
+            print(f"[INFO] Tombstone ratio {ratio:.2%} >= {self._tombstone_threshold:.0%}, compacting index...")
+            self._rebuild_index()
+            self._deleted_indices.clear()
+            print(f"[INFO] Index compacted: {self.index.ntotal} vectors remaining")
 
     def _rebuild_index(self):
-        """重建索引"""
+        """物理重建索引（排除 tombstone 项）"""
         if self.index.ntotal == 0:
             return
         try:
+            # 读取所有向量
             vectors = self.index.reconstruct_n(0, self.index.ntotal)
-            new_index = self._create_index(len(self.id_map))
-            if hasattr(new_index, 'train') and not new_index.is_trained:
-                new_index.train(vectors)
-            valid_indices = sorted(self.id_map.keys())
+            # 只保留未被删除的索引
+            valid_indices = sorted([idx for idx in self.id_map.keys() if idx not in self._deleted_indices])
+            if not valid_indices:
+                # 全部被删除，创建新空索引
+                self.cpu_index = self._create_index(0)
+                self.id_map = {}
+                self._deleted_indices.clear()
+                self.gpu_index = None
+                if self.use_gpu:
+                    self._move_to_gpu()
+                self.index = self.gpu_index if self.gpu_index else self.cpu_index
+                self._dirty = True
+                return
+
             valid_vectors = vectors[valid_indices]
+            new_index = self._create_index(len(valid_indices))
+            if hasattr(new_index, 'train') and not new_index.is_trained:
+                new_index.train(valid_vectors)
             new_index.add(valid_vectors)
+
+            # 更新 id_map（重映射内部索引）
+            new_id_map = {}
+            for new_idx, old_idx in enumerate(valid_indices):
+                new_id_map[new_idx] = self.id_map[old_idx]
+
             self.index = new_index
             self.cpu_index = new_index
+            self.id_map = new_id_map
+            self._deleted_indices.clear()
             self.gpu_index = None
             if self.use_gpu:
                 self._move_to_gpu()
+                self.index = self.gpu_index if self.gpu_index else self.cpu_index
             self._dirty = True
         except Exception as e:
-            pass
+            print(f"[ERROR] Index rebuild failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def get_vector_count(self) -> int:
         """获取向量数量"""
@@ -346,7 +418,13 @@ class FAISSVectorService:
 
     def close(self):
         """关闭服务，保存索引"""
-        self._save_index()
+        # 停止自动保存线程
+        if self._shutdown_event:
+            self._shutdown_event.set()
+        if self._save_thread and self._save_thread.is_alive():
+            self._save_thread.join(timeout=5.0)
+        # 强制保存一次
+        self._save_index(force=True)
 
 class QdrantVectorService:
     """Qdrant 向量服务实现"""

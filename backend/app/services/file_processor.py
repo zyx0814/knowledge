@@ -1,10 +1,37 @@
 import os
 import uuid
 import subprocess
+import threading
 from typing import List, Dict, Any
 from PIL import Image
 import numpy as np
 from config.config import settings
+
+# Whisper 模型缓存（避免每次视频处理都重新加载）
+_whisper_model = None
+_whisper_model_name = None
+_whisper_model_lock = threading.Lock()
+
+
+def _get_whisper_model(model_name="small"):
+    """懒加载 Whisper 模型，全局单例缓存"""
+    global _whisper_model, _whisper_model_name
+    if _whisper_model is not None and _whisper_model_name == model_name:
+        return _whisper_model
+    with _whisper_model_lock:
+        if _whisper_model is not None and _whisper_model_name == model_name:
+            return _whisper_model
+        try:
+            import whisper
+            if hasattr(whisper, 'load_model'):
+                print(f"[INFO] Loading Whisper model '{model_name}'...")
+                _whisper_model = whisper.load_model(model_name)
+                _whisper_model_name = model_name
+                print(f"[INFO] Whisper model '{model_name}' loaded successfully")
+                return _whisper_model
+        except Exception as e:
+            print(f"[ERROR] Failed to load Whisper model '{model_name}': {e}")
+    return None
 
 
 class FileProcessor:
@@ -104,28 +131,21 @@ class FileProcessor:
             "faces": []
         }
         try:
-            # 预处理图片
-            img = Image.open(file_path)
-            img = img.resize((800, 800))
-            
-            # OCR识别文字（可配置）
+            # OCR识别文字（使用原始分辨率，Tesseract 需要足够细节）
             if settings.ENABLE_OCR:
                 try:
                     import pytesseract
+                    img = Image.open(file_path)
                     result["text"] = pytesseract.image_to_string(img)
                 except Exception as e:
                     print(f"OCR识别失败: {e}")
-            
-            # 提取视觉特征（这里使用简单的均值作为示例）
-            #  img_array = np.array(img)
-            # result["features"] = img_array.mean(axis=(0, 1)).tolist()
-            
-            # 提取人脸特征（可配置）
+
+            # 提取人脸特征（可配置，使用原始文件路径）
             if settings.ENABLE_FACE_DETECTION:
                 try:
                     from app.services.face_service import FaceService
                     face_service = FaceService()
-                    
+
                     if hasattr(face_service, 'insightface_available') and face_service.insightface_available:
                         result["faces"] = face_service.extract_face_features(file_path)
                     else:
@@ -178,12 +198,10 @@ class FileProcessor:
                     cmd = ["ffmpeg", "-i", file_path, "-q:a", "0", "-map", "a", audio_path]
                     subprocess.run(cmd, capture_output=True, text=True)
                     
-                    # 使用whisper转写音频
+                    # 使用whisper转写音频（使用全局缓存模型，避免重复加载）
                     try:
-                        import whisper
-                        # 检查whisper版本和可用方法
-                        if hasattr(whisper, 'load_model'):
-                            model = whisper.load_model("small")
+                        model = _get_whisper_model("small")
+                        if model:
                             transcript = model.transcribe(audio_path)
                             result["audio_text"] = transcript["text"]
                         

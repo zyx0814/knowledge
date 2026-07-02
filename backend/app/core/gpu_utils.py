@@ -73,11 +73,17 @@ class GPUManager:
         try:
             import onnxruntime as ort
             providers = ort.get_available_providers()
-            if 'CUDAExecutionProvider' in providers:
+            gpu_providers = ['CUDAExecutionProvider', 'DmlExecutionProvider', 'TensorrtExecutionProvider', 'ROCMExecutionProvider']
+            available_gpu_providers = [p for p in gpu_providers if p in providers]
+            if available_gpu_providers:
                 self.onnxruntime_gpu_available = True
-                print("ONNX Runtime GPU 可用")
+                self._preferred_gpu_provider = available_gpu_providers[0]
+                print(f"ONNX Runtime GPU 可用，可用的 GPU providers: {available_gpu_providers}")
             else:
-                print("ONNX Runtime GPU 不可用，可用的 providers:", providers)
+                print(f"ONNX Runtime GPU 不可用，可用的 providers: {providers}")
+                if self.cuda_available:
+                    print("[提示] CUDA 设备可用但 ONNX Runtime GPU 不可用，请安装 onnxruntime-gpu:")
+                    print("       pip install onnxruntime-gpu")
         except ImportError:
             print("ONNX Runtime 未安装")
     
@@ -98,7 +104,7 @@ class GPUManager:
             import onnxruntime as ort
             providers = []
             if prefer_gpu and self.onnxruntime_gpu_available:
-                providers.append('CUDAExecutionProvider')
+                providers.append(getattr(self, '_preferred_gpu_provider', 'CUDAExecutionProvider'))
             providers.append('CPUExecutionProvider')
             return providers
         except ImportError:

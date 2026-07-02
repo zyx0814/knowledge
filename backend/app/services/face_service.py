@@ -2,7 +2,8 @@ import os
 import json
 import uuid
 import numpy as np
-from typing import List, Dict, Any, Optional
+import threading
+from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy.orm import Session
 from app.models.db import Face
 from config.config import settings
@@ -13,6 +14,229 @@ try:
     STORAGE_SERVICE_AVAILABLE = True
 except ImportError:
     STORAGE_SERVICE_AVAILABLE = False
+
+
+class FaceVectorIndex:
+    """人脸向量 FAISS 索引（单例）
+
+    使用 IndexIDMap(IndexFlatIP) 实现基于余弦相似度的人脸搜索。
+    IndexFlatIP: 归一化向量的内积 = 余弦相似度，精确搜索。
+    IndexIDMap: 支持 add_with_ids / remove_ids，通过外部 ID 直接删除。
+    """
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(FaceVectorIndex, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        import faiss
+        self.dim = 512  # InsightFace 默认特征维度
+        self.faiss = faiss
+        self.face_index_path = os.path.join(settings.FACE_INDEX_PATH)
+        os.makedirs(self.face_index_path, exist_ok=True)
+        self.index_file = os.path.join(self.face_index_path, "face_index.faiss")
+        self.id_map_file = os.path.join(self.face_index_path, "face_id_map.npy")
+        self.id_map: Dict[int, str] = {}  # faiss_int_id → face_db_uuid
+        self.index: Optional[faiss.Index] = None
+        self._dirty = False
+        self._lock = threading.Lock()
+        self._load_or_create()
+        self._initialized = True
+
+    def _load_or_create(self):
+        """从磁盘加载索引，失败则创建空索引（首次运行时从 DB 重建）"""
+        if os.path.exists(self.index_file) and os.path.exists(self.id_map_file):
+            try:
+                self.index = self.faiss.read_index(self.index_file)
+                loaded_map = np.load(self.id_map_file, allow_pickle=True).item()
+                self.id_map = {int(k): str(v) for k, v in loaded_map.items()}
+                print(f"[INFO] Face index loaded: {self.index.ntotal} faces")
+                return
+            except Exception as e:
+                print(f"[WARN] Failed to load face index from disk: {e}")
+        # 创建空索引
+        self.index = self.faiss.IndexIDMap(self.faiss.IndexFlatIP(self.dim))
+        self.id_map = {}
+        self._dirty = True
+        print("[INFO] Created new empty face index")
+
+    def _faiss_id(self, face_db_id: str) -> int:
+        """将 face DB UUID 字符串映射为 FAISS int64 ID"""
+        return hash(face_db_id) % (2**63)
+
+    def add(self, face_db_id: str, embedding: List[float]) -> bool:
+        """添加一个人脸向量到索引（自动 L2 归一化）"""
+        with self._lock:
+            try:
+                emb = np.array([embedding], dtype=np.float32)
+                self.faiss.normalize_L2(emb)
+                faiss_id = self._faiss_id(face_db_id)
+
+                if faiss_id in self.id_map:
+                    self.remove(face_db_id)
+
+                self.index.add_with_ids(emb, np.array([faiss_id], dtype=np.int64))
+                self.id_map[faiss_id] = face_db_id
+                self._dirty = True
+                return True
+            except Exception as e:
+                print(f"[ERROR] FaceVectorIndex.add failed: {e}")
+                return False
+
+    def add_batch(self, face_db_ids: List[str], embeddings: List[List[float]]) -> int:
+        """批量添加人脸向量"""
+        if not face_db_ids or not embeddings:
+            return 0
+        with self._lock:
+            try:
+                emb_array = np.array(embeddings, dtype=np.float32)
+                self.faiss.normalize_L2(emb_array)
+                faiss_ids = np.array([self._faiss_id(fid) for fid in face_db_ids], dtype=np.int64)
+
+                for fid in face_db_ids:
+                    faiss_id = self._faiss_id(fid)
+                    if faiss_id in self.id_map:
+                        self.remove(fid)
+
+                self.index.add_with_ids(emb_array, faiss_ids)
+                for i, fid in enumerate(face_db_ids):
+                    self.id_map[int(faiss_ids[i])] = fid
+                self._dirty = True
+                return len(face_db_ids)
+            except Exception as e:
+                print(f"[ERROR] FaceVectorIndex.add_batch failed: {e}")
+                return 0
+
+    def search(self, embedding: List[float], k: int = 10) -> List[Tuple[str, float]]:
+        """搜索最相似的 k 个人脸，返回 [(face_db_id, similarity), ...]"""
+        with self._lock:
+            if self.index is None or self.index.ntotal == 0:
+                return []
+            try:
+                emb = np.array([embedding], dtype=np.float32)
+                self.faiss.normalize_L2(emb)
+                actual_k = min(k, self.index.ntotal)
+                distances, indices = self.index.search(emb, actual_k)
+
+                results = []
+                for i in range(len(indices[0])):
+                    faiss_id = indices[0][i]
+                    similarity = float(distances[0][i])
+                    if faiss_id != -1 and faiss_id in self.id_map:
+                        results.append((self.id_map[faiss_id], similarity))
+                return results
+            except Exception as e:
+                print(f"[ERROR] FaceVectorIndex.search failed: {e}")
+                return []
+
+    def remove(self, face_db_id: str) -> bool:
+        """从索引中删除一个人脸"""
+        with self._lock:
+            try:
+                faiss_id = self._faiss_id(face_db_id)
+                if faiss_id not in self.id_map:
+                    return False
+                selector = self.faiss.IDSelectorArray([faiss_id])
+                self.index.remove_ids(selector)
+                self.id_map.pop(faiss_id, None)
+                self._dirty = True
+                return True
+            except Exception as e:
+                print(f"[ERROR] FaceVectorIndex.remove failed: {e}")
+                return False
+
+    def remove_batch(self, face_db_ids: List[str]) -> int:
+        """批量删除人脸"""
+        with self._lock:
+            count = 0
+            try:
+                faiss_ids = []
+                for fid in face_db_ids:
+                    faiss_id = self._faiss_id(fid)
+                    if faiss_id in self.id_map:
+                        faiss_ids.append(faiss_id)
+                        self.id_map.pop(faiss_id, None)
+                if faiss_ids:
+                    selector = self.faiss.IDSelectorArray(faiss_ids)
+                    self.index.remove_ids(selector)
+                    count = len(faiss_ids)
+                    self._dirty = True
+            except Exception as e:
+                print(f"[ERROR] FaceVectorIndex.remove_batch failed: {e}")
+            return count
+
+    def rebuild_from_db(self, db: Session):
+        """从 Face 表全量重建索引（用于恢复/迁移）"""
+        try:
+            print("[INFO] Rebuilding face index from database...")
+            all_faces = db.query(Face).all()
+
+            # 创建新索引
+            new_index = self.faiss.IndexIDMap(self.faiss.IndexFlatIP(self.dim))
+            new_id_map: Dict[int, str] = {}
+
+            if all_faces:
+                embeddings = []
+                faiss_ids = []
+                for face in all_faces:
+                    if not face.embedding:
+                        continue
+                    try:
+                        emb = np.array(json.loads(face.embedding), dtype=np.float32)
+                        embeddings.append(emb)
+                        faiss_id = self._faiss_id(str(face.id))
+                        faiss_ids.append(faiss_id)
+                        new_id_map[faiss_id] = str(face.id)
+                    except Exception:
+                        continue
+
+                if embeddings:
+                    emb_array = np.stack(embeddings)
+                    self.faiss.normalize_L2(emb_array)
+                    faiss_id_array = np.array(faiss_ids, dtype=np.int64)
+                    new_index.add_with_ids(emb_array, faiss_id_array)
+
+            self.index = new_index
+            self.id_map = new_id_map
+            self._dirty = True
+            self.save()
+            print(f"[INFO] Face index rebuilt: {self.index.ntotal} faces")
+        except Exception as e:
+            print(f"[ERROR] Face index rebuild failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def save(self):
+        """持久化索引到磁盘"""
+        with self._lock:
+            if not self._dirty:
+                return
+            try:
+                self.faiss.write_index(self.index, self.index_file)
+                clean_map = {int(k): str(v) for k, v in self.id_map.items()}
+                np.save(self.id_map_file, clean_map)
+                self._dirty = False
+            except Exception as e:
+                print(f"[ERROR] FaceVectorIndex.save failed: {e}")
+
+    def count(self) -> int:
+        """返回索引入脸数量"""
+        if self.index is None:
+            return 0
+        return self.index.ntotal
+
+    def ensure_loaded(self, db: Optional[Session] = None):
+        """确保索引已加载（若为空则尝试从 DB 重建）"""
+        if self.index is None or self.index.ntotal == 0:
+            if db is not None:
+                self.rebuild_from_db(db)
+
+
 class FaceService:
     """人脸服务类"""
     _instance = None
@@ -29,6 +253,8 @@ class FaceService:
         os.makedirs(self.face_db_path, exist_ok=True)
         self.face_embedding_dim = 512  # InsightFace默认特征维度
         self.insightface_available = False
+        # 人脸向量 FAISS 索引
+        self.face_index = FaceVectorIndex()
         # 延迟导入InsightFace，避免启动时依赖问题
         self.face_analyzer = None
         self._init_face_analyzer()
@@ -215,103 +441,104 @@ class FaceService:
         except Exception as e:
             return ""
     def find_similar_faces(self, embedding: List[float], threshold: float = 0.6, limit: int = 10) -> List[Dict[str, Any]]:
-        """查找相似人脸（人脸和特征合并后）"""
+        """查找相似人脸（使用 FAISS 索引，O(log n)）"""
         from sqlalchemy.orm import Session
         from app.core.database import get_db
+
+        # 确保索引已加载
+        self.face_index.ensure_loaded()
+
+        # FAISS 搜索
+        search_results = self.face_index.search(embedding, k=limit * 2)
+
+        if not search_results:
+            return []
+
+        # 收集匹配的 face_db_id 和相似度
+        face_scores: Dict[str, float] = {}
+        matched_ids = []
+        for face_db_id, similarity in search_results:
+            if similarity >= threshold:
+                matched_ids.append(face_db_id)
+                face_scores[face_db_id] = similarity
+
+        if not matched_ids:
+            return []
+
+        # 批量查询 DB 获取完整信息
         db = next(get_db())
         try:
-            # 获取所有人脸（现在Face表直接包含特征）
-            all_faces = db.query(Face).all()
-            # 计算相似度
-            import numpy as np
-            query_embedding = np.array(embedding)
+            faces = db.query(Face).filter(Face.id.in_(matched_ids)).all()
             similar_faces = []
-            for face in all_faces:
-                # 解析嵌入向量
-                try:
-                    # 检查embedding属性是否存在且不为空
-                    if not hasattr(face, 'embedding') or not face.embedding:
-                        continue
-                    face_embedding = np.array(json.loads(face.embedding))
-                    # 计算余弦相似度
-                    similarity = np.dot(query_embedding, face_embedding) / (
-                        np.linalg.norm(query_embedding) * np.linalg.norm(face_embedding)
-                    )
-                    # 过滤相似度高于阈值的人脸
-                    if similarity >= threshold:
-                        similar_faces.append({
-                            "face_id": face.id,
-                            "feature_id": face.id,  # 人脸和特征合并后，ID相同
-                            "file_id": face.file_id,
-                            "image_path": face.image_path,
-                            "similarity": float(similarity),
-                            "confidence": face.confidence
-                        })
-                except Exception as e:
-                    continue
-            # 按相似度排序并限制结果数量
+            for face in faces:
+                similar_faces.append({
+                    "face_id": str(face.id),
+                    "feature_id": str(face.id),
+                    "file_id": str(face.file_id) if face.file_id else "",
+                    "image_path": face.image_path,
+                    "similarity": face_scores.get(str(face.id), 0.0),
+                    "confidence": face.confidence
+                })
+            # 按相似度排序
             similar_faces.sort(key=lambda x: x["similarity"], reverse=True)
             return similar_faces[:limit]
         finally:
             db.close()
     def save_face_features(self, db: Session, file_id: str, face_features: List[Dict[str, Any]]) -> List[str]:
-        """保存人脸特征到数据库（人脸和特征合并）"""
+        """保存人脸特征到数据库（使用 FAISS 索引查找重复，O(log n)）"""
         saved_face_ids = []
         similarity_threshold = 0.6  # 相似度阈值
+
+        # 确保索引已加载
+        self.face_index.ensure_loaded(db)
+
         for feature in face_features:
-            # 检查是否存在相似人脸
-            existing_face_id = None
-            max_similarity = 0.0
-            # 获取所有人脸（现在Face表直接包含特征）
-            all_faces = db.query(Face).all()
-            import numpy as np
-            current_embedding = np.array(feature["embedding"])
-            for existing_face in all_faces:
-                try:
-                    # 检查embedding属性是否存在且不为空
-                    if not hasattr(existing_face, 'embedding') or not existing_face.embedding:
-                        continue
-                    existing_embedding = np.array(json.loads(existing_face.embedding))
-                    # 计算余弦相似度
-                    similarity = np.dot(current_embedding, existing_embedding) / (
-                        np.linalg.norm(current_embedding) * np.linalg.norm(existing_embedding)
-                    )
-                    if similarity > max_similarity:
-                        max_similarity = similarity
-                        existing_face_id = existing_face.id
-                except Exception as e:
-                    continue
+            embedding = feature["embedding"]
+
+            # 使用 FAISS 索引查找最近邻（O(log n) vs 原先的 O(n)）
+            existing_match = None
+            if self.face_index.count() > 0:
+                search_results = self.face_index.search(embedding, k=1)
+                if search_results and search_results[0][1] >= similarity_threshold:
+                    existing_match = search_results[0][0]  # face_db_id
+
             # 如果找到相似度高于阈值的人脸，跳过添加
-            if max_similarity >= similarity_threshold and existing_face_id:
-                saved_face_ids.append(existing_face_id)
+            if existing_match:
+                saved_face_ids.append(existing_match)
                 # 删除已生成的人脸图片
                 if feature.get("image_path"):
                     try:
                         image_path = feature["image_path"]
                         if image_path.startswith("minio://") and STORAGE_SERVICE_AVAILABLE:
-                            # 从 MinIO 删除
                             object_name = image_path.replace("minio://", "").split("/", 1)[-1]
                             storage_service.delete_file(object_name)
                         elif os.path.exists(image_path):
                             os.remove(image_path)
-                    except Exception as e:
+                    except Exception:
                         pass
                 continue
-            # 生成新人脸ID并创建记录（人脸和特征合并）
+
+            # 生成新人脸ID并创建记录
             face_id = str(uuid.uuid4())
             face = Face(
                 id=face_id,
-                name=None,  # 初始无名称
-                group_id=None,  # 初始无分组
+                name=None,
+                group_id=None,
                 file_id=file_id,
                 image_path=feature["image_path"],
-                embedding=json.dumps(feature["embedding"]),
+                embedding=json.dumps(embedding),
                 confidence=feature["confidence"],
                 bbox=json.dumps(feature["bbox"])
             )
             db.add(face)
             saved_face_ids.append(face_id)
+
+            # 添加到 FAISS 索引
+            self.face_index.add(face_id, embedding)
+
         db.commit()
+        # 保存索引到磁盘
+        self.face_index.save()
         return saved_face_ids
     def merge_faces(self, db: Session, face_ids: List[str], new_name: str = None) -> str:
         """合并相似人脸"""
@@ -380,7 +607,7 @@ class FaceService:
         db.commit()
         return True
     def delete_face(self, db: Session, face_id: str) -> bool:
-        """删除人脸（人脸和特征合并后）"""
+        """删除人脸（同时清理 FAISS 索引）"""
         # 删除人脸记录
         face = db.query(Face).filter(Face.id == face_id).first()
         if not face:
@@ -395,9 +622,12 @@ class FaceService:
                     storage_service.delete_file(object_name)
                 elif os.path.exists(image_path):
                     os.remove(image_path)
-            except Exception as e:
+            except Exception:
                 pass
+        # 从 FAISS 索引中移除
+        self.face_index.remove(face_id)
         # 删除人脸记录
         db.delete(face)
         db.commit()
+        self.face_index.save()
         return True

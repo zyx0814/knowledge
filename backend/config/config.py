@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     # 人脸模型配置
     FACE_MODEL_PATH: str = "models/insightface"  # 模型根目录，FaceAnalysis会在其中查找models子目录
     FACE_MODEL_NAME: str = "buffalo_l"
+    # 人脸向量索引配置
+    FACE_INDEX_PATH: str = "data/faces"  # 人脸 FAISS 索引存储路径
     # 通用模型目录
     MODELS_DIR: str = "models"
     MAX_FILE_SIZE: int = 10 * 1024 * 1024 * 1024  # 10GB
@@ -93,9 +95,12 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "jinaai/jina-clip-v2"  # 改为 jinaai/jina-clip-v2 即可升级
 
     # 处理配置
-    MAX_WORKERS: int = 2
+    MAX_WORKERS: int = 8
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 50
+    # 向量索引保存配置
+    VECTOR_INDEX_SAVE_INTERVAL: int = 30  # 每30秒自动保存一次
+    VECTOR_INDEX_BATCH_SIZE: int = 100  # 每添加100个向量触发一次保存
     # 视频处理配置
     VIDEO_FRAME_INTERVAL: int = 2  # 每2秒抽帧
     MAX_FRAMES_PER_VIDEO: int = 300
